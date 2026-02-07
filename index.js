@@ -1,8 +1,9 @@
-// index.js — Render + Twilio timeout-proof (FAST_ACK)
+// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints
 // - Responds 200 OK immediately (prevents Twilio 11200 timeouts)
 // - Replies to the lead via Twilio API in background
 // - DEV_MODE=true suppresses ALL outbound messages by default (no quota usage)
 // - Toggle REPLY_TO_LEAD_IN_DEV=true to test WhatsApp replies while DEV_MODE=true
+// - Debug endpoints to inspect in-memory conversations on Render (optional token)
 
 require("dotenv").config();
 
@@ -27,6 +28,9 @@ const FAST_ACK = String(process.env.FAST_ACK || "true").toLowerCase() === "true"
 const REPLY_TO_LEAD_IN_DEV =
   String(process.env.REPLY_TO_LEAD_IN_DEV || "false").toLowerCase() === "true";
 
+// Optional: protect debug endpoints
+const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
+
 const express = require("express");
 const bodyParser = require("body-parser");
 
@@ -46,14 +50,14 @@ app.get("/health", (req, res) =>
   })
 );
 
-// ======= Folders =======
+// ======= Folders (ephemeral on Render, still useful in Logs) =======
 const CONV_DIR = path.join(__dirname, "conversations");
 const LEADS_DIR = path.join(__dirname, "leads");
 for (const dir of [CONV_DIR, LEADS_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-// ======= State =======
+// ======= State (in-memory) =======
 const leads = Object.create(null);
 
 // ======= Helpers =======
@@ -148,11 +152,16 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+function canSendOutbound() {
+  // DEV_MODE: suppress outbound unless explicitly allowed
+  if (!DEV_MODE) return true;
+  return REPLY_TO_LEAD_IN_DEV;
+}
+
 async function sendWhatsApp(toWhatsApp, body) {
   if (!toWhatsApp) return;
 
-  // DEV_MODE: suppress outbound unless explicitly allowed
-  if (DEV_MODE && !REPLY_TO_LEAD_IN_DEV) {
+  if (!canSendOutbound()) {
     console.log("DEV_MODE: outbound suppressed. Would send to:", toWhatsApp, "Body:", body);
     return;
   }
@@ -163,6 +172,60 @@ async function sendWhatsApp(toWhatsApp, body) {
     body,
   });
 }
+
+// ======= Debug endpoints (optional) =======
+function requireDebugToken(req, res) {
+  if (!DEBUG_TOKEN) return true; // if not set, it's open
+  const t = String(req.query.token || req.headers["x-debug-token"] || "");
+  if (t !== DEBUG_TOKEN) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+app.get("/debug/leads", (req, res) => {
+  if (!requireDebugToken(req, res)) return;
+
+  const items = Object.values(leads).map((l) => ({
+    phone: l.phone,
+    name: l.name || "",
+    zone: l.zone || "",
+    createdAt: l.createdAt,
+    handedOff: Boolean(l.handedOff),
+    pendingHandoff: l.pendingHandoff || null,
+    messagesCount: (l.messages || []).length,
+    lastAt: (l.messages || []).length ? l.messages[l.messages.length - 1].ts : null,
+    lastFrom: (l.messages || []).length ? l.messages[l.messages.length - 1].from : null,
+    lastText: (l.messages || []).length ? l.messages[l.messages.length - 1].text : null,
+  }));
+
+  items.sort((a, b) => String(b.lastAt || "").localeCompare(String(a.lastAt || "")));
+  res.json({ ok: true, count: items.length, leads: items });
+});
+
+app.get("/debug/conversation", (req, res) => {
+  if (!requireDebugToken(req, res)) return;
+
+  const phone = String(req.query.phone || "").trim();
+  if (!phone) return res.status(400).json({ ok: false, error: "missing ?phone=..." });
+
+  const lead = leads[phone];
+  if (!lead) return res.status(404).json({ ok: false, error: "lead_not_found" });
+
+  res.json({
+    ok: true,
+    lead: {
+      phone: lead.phone,
+      name: lead.name || "",
+      zone: lead.zone || "",
+      createdAt: lead.createdAt,
+      handedOff: Boolean(lead.handedOff),
+      pendingHandoff: lead.pendingHandoff || null,
+    },
+    messages: lead.messages || [],
+  });
+});
 
 // ======= AI: lead signals (name/zone) =======
 async function extractLeadSignals({ incoming, lead }) {
@@ -346,8 +409,9 @@ async function processInbound({ incoming, from, lead }) {
     );
   const humanIntent = /humano|asesor|vendedor|persona|operador|hablar con alguien|derivame|pasame con/i.test(incoming);
 
-  // If we need name/zone for pending handoff or a new handoff intent, try to extract (fast)
   const needsHandoff = budgetIntent || visitIntent || humanIntent || (lead.pendingHandoff && !lead.handedOff);
+
+  // If we need name/zone for handoff flow, try a fast extraction (timeout-protected)
   if (needsHandoff && (!lead.name || !lead.zone)) {
     try {
       const sig = await withTimeout(extractLeadSignals({ incoming, lead }), 2000);
@@ -364,6 +428,7 @@ async function processInbound({ incoming, from, lead }) {
     if (lead.name && lead.zone) {
       const type = lead.pendingHandoff.type;
       lead.pendingHandoff = null;
+
       await doHandoff({ lead, incoming, reasonTag: type });
 
       const reply =
@@ -377,6 +442,7 @@ async function processInbound({ incoming, from, lead }) {
       return;
     } else {
       const ask = askForMissingLeadData(lead);
+
       appendMessage(lead, "bot", ask);
       upsertConversationFile(lead);
 
@@ -388,12 +454,12 @@ async function processInbound({ incoming, from, lead }) {
   // If handoff already happened: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
   if (lead.handedOff) {
     const reply = `¡Gracias${lead.name ? `, ${lead.name}` : ""}! Ya se lo pasé al asesor 🙌`;
+
     appendMessage(lead, "bot", reply);
     upsertConversationFile(lead);
 
     await sendWhatsApp(from, reply);
 
-    // optional: forward to HANDOFF_TO (only if not DEV_MODE)
     if (!DEV_MODE && HANDOFF_TO) {
       await sendWhatsApp(
         HANDOFF_TO,
@@ -435,8 +501,9 @@ async function processInbound({ incoming, from, lead }) {
     return;
   }
 
-  // Otherwise: AI assists (timeout protected)
+  // Otherwise: AI assists (timeout-protected)
   let reply = "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
+
   try {
     const out = await withTimeout(aiReply({ from, incoming, lead }), 9000);
     if (out && typeof out.reply === "string") reply = out.reply;
@@ -452,7 +519,7 @@ async function processInbound({ incoming, from, lead }) {
 }
 
 // ======= Webhook =======
-app.post("/whatsapp", async (req, res) => {
+app.post("/whatsapp", (req, res) => {
   console.log("INBOUND /whatsapp", {
     at: new Date().toISOString(),
     from: req.body.From,
@@ -464,6 +531,7 @@ app.post("/whatsapp", async (req, res) => {
   const phone = normalizePhone(from);
 
   const lead = getLead(phone);
+
   appendMessage(lead, "lead", incoming);
   upsertConversationFile(lead);
 
@@ -477,17 +545,20 @@ app.post("/whatsapp", async (req, res) => {
       appendMessage(lead, "system", `PROCESS_INBOUND_ERR: ${e?.message || e}`);
       upsertConversationFile(lead);
     });
+
     return;
   }
 
-  // Fallback (non-FAST_ACK): try to process synchronously (not recommended on Render free)
-  try {
-    await processInbound({ incoming, from, lead });
-    return res.status(200).send("OK");
-  } catch (e) {
-    console.error("sync processInbound error:", e?.message || e);
-    return res.status(200).send("OK");
-  }
+  // Fallback (non-FAST_ACK): synchronous (not recommended)
+  (async () => {
+    try {
+      await processInbound({ incoming, from, lead });
+    } catch (e) {
+      console.error("sync processInbound error:", e?.message || e);
+    } finally {
+      res.status(200).send("OK");
+    }
+  })();
 });
 
 // ======= Listen (Render uses PORT) =======
@@ -497,4 +568,5 @@ app.listen(PORT, () => {
   console.log("DEV_MODE =", DEV_MODE);
   console.log("FAST_ACK =", FAST_ACK);
   console.log("REPLY_TO_LEAD_IN_DEV =", REPLY_TO_LEAD_IN_DEV);
+  console.log("DEBUG_TOKEN set =", Boolean(DEBUG_TOKEN));
 });
