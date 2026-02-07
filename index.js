@@ -489,6 +489,18 @@ function askForMissingLeadData(lead) {
   return "Perfecto 🙂 ¿en qué zona/barrio estás (Rosario o alrededores)?";
 }
 
+function ensureNameZoneBeforeHandoff({ lead, type, incoming }) {
+  // Si falta algo, dejamos pendiente y pedimos datos
+  if (!lead.name || !lead.zone) {
+    lead.pendingHandoff = { type, lastIntentText: incoming };
+    return {
+      ok: false,
+      reply: askForMissingLeadData(lead),
+    };
+  }
+  return { ok: true, reply: "" };
+}
+
 function extractByRegex(incoming) {
   const text = String(incoming || "").trim();
 
@@ -562,31 +574,30 @@ async function processInbound({ incoming, from, lead }) {
 
   // 3) Pending handoff: continue collecting
   if (lead.pendingHandoff && !lead.handedOff) {
-    if (lead.name && lead.zone) {
-      const type = lead.pendingHandoff.type;
-      lead.pendingHandoff = null;
+  // Si ya juntamos nombre y zona -> handoff
+  if (lead.name && lead.zone) {
+    const type = lead.pendingHandoff.type;
+    lead.pendingHandoff = null;
 
-      await doHandoff({ lead, incoming, reasonTag: type });
+    await doHandoff({ lead, incoming, reasonTag: type });
 
-      const reply =
-        `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
-        `Gracias por escribirnos.`;
+    const reply =
+      `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
+      `Gracias por escribirnos.`;
 
-      appendMessage(lead, "bot", reply);
-      upsertConversationFile(lead);
-
-      await sendWhatsApp(from, reply);
-      return;
-    } else {
-      const ask = askForMissingLeadData(lead);
-
-      appendMessage(lead, "bot", ask);
-      upsertConversationFile(lead);
-
-      await sendWhatsApp(from, ask);
-      return;
-    }
+    appendMessage(lead, "bot", reply);
+    upsertConversationFile(lead);
+    await sendWhatsApp(from, reply);
+    return;
   }
+
+  // Todavía falta algo -> preguntar lo que falta (SIN cambiar type)
+  const ask = askForMissingLeadData(lead);
+  appendMessage(lead, "bot", ask);
+  upsertConversationFile(lead);
+  await sendWhatsApp(from, ask);
+  return;
+}
 
   // 4) After handoff: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
   if (lead.handedOff) {
@@ -614,16 +625,28 @@ async function processInbound({ incoming, from, lead }) {
   if (budgetIntent || visitIntent || humanIntent) {
     const type = visitIntent ? "visit" : budgetIntent ? "budget" : "human";
 
-    if (!lead.name || !lead.zone) {
-      lead.pendingHandoff = { type, lastIntentText: incoming };
-      const ask = askForMissingLeadData(lead);
-
-      appendMessage(lead, "bot", ask);
+    // GATE: nombre + zona antes de handoff
+    const gate = ensureNameZoneBeforeHandoff({ lead, type, incoming });
+    if (!gate.ok) {
+      appendMessage(lead, "bot", gate.reply);
       upsertConversationFile(lead);
-
-      await sendWhatsApp(from, ask);
+      await sendWhatsApp(from, gate.reply);
       return;
     }
+
+    // Si ok, seguimos normal
+    await doHandoff({ lead, incoming, reasonTag: type });
+
+    const reply =
+      `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
+      `Gracias por escribirnos.`;
+
+    appendMessage(lead, "bot", reply);
+    upsertConversationFile(lead);
+
+    await sendWhatsApp(from, reply);
+    return;
+  }
 
     await doHandoff({ lead, incoming, reasonTag: type });
 
