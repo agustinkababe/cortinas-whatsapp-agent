@@ -4,6 +4,8 @@
 // - DEV_MODE=true suppresses ALL outbound messages (no quota usage) but still logs + debug endpoints
 // - Debug endpoints to inspect in-memory conversations on Render (optional token)
 // - Adds recoveryReply() fallback: apologizes, summarizes context, asks 1 best next question (no conversation reset)
+// - FIX: handoff is ALWAYS gated by name+zone (pendingHandoff flow). Removes duplicated/buggy blocks.
+// - FIX: pendingHandoff flow extracts name/zone via regex first, then AI backup.
 
 require("dotenv").config();
 
@@ -222,30 +224,58 @@ app.get("/debug/last.txt", (req, res) => {
   if (!requireDebugToken(req, res)) return;
 
   const all = Object.values(leads || {});
-  if (!all.length) {
-    res.set("Content-Type", "text/plain; charset=utf-8");
-    return res.status(200).send("No leads in memory yet.\n");
-  }
+  res.set("Content-Type", "text/plain; charset=utf-8");
+
+  if (!all.length) return res.status(200).send("No leads in memory yet.\n");
 
   // pick lead with newest message timestamp
   let latest = null;
   for (const l of all) {
     const msgs = l.messages || [];
-    const lastTs = msgs.length ? msgs[msgs.length - 1].ts : null;
+    const lastTs = msgs.length ? msgs[msgs.length - 1].ts : "";
     if (!latest) {
       latest = { lead: l, lastTs };
       continue;
     }
-    const bestTs = latest.lastTs || "";
-    if ((lastTs || "") > bestTs) latest = { lead: l, lastTs };
+    if (lastTs > (latest.lastTs || "")) latest = { lead: l, lastTs };
   }
 
-  const lead = latest.lead;
-  const txt = buildTranscript(lead);
-
-  res.set("Content-Type", "text/plain; charset=utf-8");
-  return res.status(200).send(txt);
+  return res.status(200).send(buildTranscript(latest.lead));
 });
+
+// ======= Lead signals (name/zone) =======
+function extractByRegex(incoming) {
+  const text = String(incoming || "").trim();
+
+  // NAME: message is only a name (e.g., "Agustin" / "Agustin Kababe")
+  let name = "";
+  if (/^[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}){0,2}$/.test(text)) {
+    name = text;
+  }
+
+  // NAME: "soy Agustin", "me llamo Agustin", "mi nombre es Agustin"
+  const m1 = text.match(
+    /\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2})/i
+  );
+  if (!name && m1?.[1]) name = m1[1].trim();
+
+  // ZONE: "estoy en barrio cura en rosario", "vivo en fisherton", "soy de rosario"
+  let zone = "";
+  const m2 = text.match(/\b(?:estoy en|vivo en|soy de)\s+(.+)$/i);
+  if (m2?.[1]) zone = m2[1].trim();
+
+  if (zone) {
+    zone = zone.replace(/[.!,;]+$/g, "").trim().slice(0, 80);
+  }
+
+  return { name, zone };
+}
+
+function applySignalsToLead(lead, sig) {
+  if (!sig) return;
+  if (!lead.name && sig.name) lead.name = String(sig.name).trim();
+  if (!lead.zone && sig.zone) lead.zone = String(sig.zone).trim();
+}
 
 // ======= AI: lead signals (name/zone) =======
 async function extractLeadSignals({ incoming, lead }) {
@@ -344,7 +374,7 @@ SOLO JSON: {"reply":"...", "needs_human": true/false}
 
   const recent = (lead?.messages || [])
     .slice(-10)
-    .map((m) => `${m.from === "lead" ? "Cliente" : "Asistente"}: ${m.text}`)
+    .map((m) => `${m.from === "lead" ? "Cliente" : m.from === "bot" ? "Asistente" : "Sistema"}: ${m.text}`)
     .join("\n");
 
   const leadCtx = `
@@ -425,17 +455,16 @@ SOLO JSON: {"reply":"..."}
   const text = (r.output_text || "").trim();
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) {
-    // ultra-safe local fallback (no reset)
-    const knownLiving = /living|comedor|living-comedor/i.test(transcript);
-    const knownOffice = /oficina/i.test(transcript);
-    const knownBedroom = /dormitorio|habitación/i.test(transcript);
 
-    let ask = "¿Qué te importa más: oscurecer, mantener luz natural o bajar reflejos?";
-    if (knownLiving || knownOffice || knownBedroom) {
-      ask = "¿Qué te importa más ahí: oscurecer, mantener luz natural o bajar reflejos?";
-    }
-    return { reply: `Disculpá, me faltó un dato para orientarte bien. ${ask}` };
+  if (start < 0 || end <= start) {
+    const hasAmb =
+      /living|comedor|oficina|dormitorio|habitación/i.test(transcript);
+
+    const ask = hasAmb
+      ? "¿Qué te importa más ahí: bajar reflejos, mantener luz natural o sumar privacidad?"
+      : "¿Para qué ambiente sería: living, dormitorio u oficina?";
+
+    return { reply: `Disculpá, se me cortó una parte. ${ask}` };
   }
 
   try {
@@ -444,7 +473,11 @@ SOLO JSON: {"reply":"..."}
       return { reply: parsed.reply.trim() };
     }
   } catch {}
-  return { reply: "Disculpá, me faltó un dato para orientarte bien. ¿Qué te importa más: oscurecer, mantener luz natural o bajar reflejos?" };
+
+  return {
+    reply:
+      "Disculpá, se me cortó una parte. ¿Qué te importa más: bajar reflejos, mantener luz natural o sumar privacidad?",
+  };
 }
 
 // ======= Handoff helper =======
@@ -483,68 +516,27 @@ function askForMissingLeadData(lead) {
   const missingZone = !lead.zone;
 
   if (missingName && missingZone) {
-    return "Dale 🙂 Antes de pasarte con un asesor, ¿me decís tu nombre y en qué zona/barrio estás?";
+    return "Dale 🙂 Para coordinarlo bien, ¿me decís tu nombre y en qué zona/barrio estás?";
   }
-  if (missingName) return "Dale 🙂 Antes de pasarte con un asesor, ¿me decís tu nombre?";
-  return "Perfecto 🙂 ¿en qué zona/barrio estás (Rosario o alrededores)?";
+  if (missingName) return "Dale 🙂 ¿Me decís tu nombre?";
+  return "Perfecto 🙂 ¿En qué zona/barrio estás (Rosario o alrededores)?";
 }
 
 function ensureNameZoneBeforeHandoff({ lead, type, incoming }) {
-  // Si falta algo, dejamos pendiente y pedimos datos
   if (!lead.name || !lead.zone) {
     lead.pendingHandoff = { type, lastIntentText: incoming };
-    return {
-      ok: false,
-      reply: askForMissingLeadData(lead),
-    };
+    return { ok: false, reply: askForMissingLeadData(lead) };
   }
   return { ok: true, reply: "" };
 }
 
-function extractByRegex(incoming) {
-  const text = String(incoming || "").trim();
-
-  // NAME: si el mensaje ES solo un nombre (ej: "Agustin")
-  let name = "";
-  if (/^[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}){0,2}$/.test(text)) {
-    name = text;
-  }
-
-  // NAME: "soy Agustin", "me llamo Agustin", "mi nombre es Agustin"
-  const m1 = text.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2})/i);
-  if (!name && m1?.[1]) name = m1[1].trim();
-
-  // ZONE: "estoy en barrio cura en rosario", "vivo en fisherton", "soy de rosario"
-  let zone = "";
-  const m2 = text.match(/\b(?:estoy en|vivo en|soy de)\s+(.+)$/i);
-  if (m2?.[1]) zone = m2[1].trim();
-
-  if (zone) {
-    zone = zone
-      .replace(/[.!,;]+$/g, "")
-      .trim()
-      .slice(0, 80);
-  }
-
-  return { name, zone };
-}
-
-function applySignalsToLead(lead, sig) {
-  if (!sig) return;
-  if (!lead.name && sig.name) lead.name = String(sig.name).trim();
-  if (!lead.zone && sig.zone) lead.zone = String(sig.zone).trim();
-}
-
 // ======= Main processing (async, after FAST_ACK) =======
 async function processInbound({ incoming, from, lead }) {
-  // 0) Regex extraction ALWAYS (instant, no timeouts)
+  // 0) Quick regex extraction ALWAYS (instant, no timeouts)
   try {
     const quick = extractByRegex(incoming);
     applySignalsToLead(lead, quick);
     upsertConversationFile(lead);
-
-    // opcional: para debug fino
-    console.log("SIGNALS quick:", quick, "lead now:", { name: lead.name, zone: lead.zone });
   } catch (e) {
     console.log("extractByRegex/applySignals error:", e?.message || e);
   }
@@ -565,8 +557,6 @@ async function processInbound({ incoming, from, lead }) {
       const sig = await withTimeout(extractLeadSignals({ incoming, lead }), 2500);
       applySignalsToLead(lead, sig);
       upsertConversationFile(lead);
-
-      console.log("SIGNALS ai:", sig, "lead now:", { name: lead.name, zone: lead.zone });
     } catch (e) {
       console.log("extractLeadSignals timeout/err:", e?.message || e);
     }
@@ -574,30 +564,29 @@ async function processInbound({ incoming, from, lead }) {
 
   // 3) Pending handoff: continue collecting
   if (lead.pendingHandoff && !lead.handedOff) {
-  // Si ya juntamos nombre y zona -> handoff
-  if (lead.name && lead.zone) {
-    const type = lead.pendingHandoff.type;
-    lead.pendingHandoff = null;
+    if (lead.name && lead.zone) {
+      const type = lead.pendingHandoff.type;
+      lead.pendingHandoff = null;
 
-    await doHandoff({ lead, incoming, reasonTag: type });
+      await doHandoff({ lead, incoming, reasonTag: type });
 
-    const reply =
-      `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
-      `Gracias por escribirnos.`;
+      const reply =
+        `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
+        `Gracias por escribirnos.`;
 
-    appendMessage(lead, "bot", reply);
+      appendMessage(lead, "bot", reply);
+      upsertConversationFile(lead);
+
+      await sendWhatsApp(from, reply);
+      return;
+    }
+
+    const ask = askForMissingLeadData(lead);
+    appendMessage(lead, "bot", ask);
     upsertConversationFile(lead);
-    await sendWhatsApp(from, reply);
+    await sendWhatsApp(from, ask);
     return;
   }
-
-  // Todavía falta algo -> preguntar lo que falta (SIN cambiar type)
-  const ask = askForMissingLeadData(lead);
-  appendMessage(lead, "bot", ask);
-  upsertConversationFile(lead);
-  await sendWhatsApp(from, ask);
-  return;
-}
 
   // 4) After handoff: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
   if (lead.handedOff) {
@@ -621,11 +610,10 @@ async function processInbound({ incoming, from, lead }) {
     return;
   }
 
-  // 5) New handoff intent
+  // 5) New handoff intent (GATED by name+zone)
   if (budgetIntent || visitIntent || humanIntent) {
     const type = visitIntent ? "visit" : budgetIntent ? "budget" : "human";
 
-    // GATE: nombre + zona antes de handoff
     const gate = ensureNameZoneBeforeHandoff({ lead, type, incoming });
     if (!gate.ok) {
       appendMessage(lead, "bot", gate.reply);
@@ -633,20 +621,6 @@ async function processInbound({ incoming, from, lead }) {
       await sendWhatsApp(from, gate.reply);
       return;
     }
-
-    // Si ok, seguimos normal
-    await doHandoff({ lead, incoming, reasonTag: type });
-
-    const reply =
-      `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
-      `Gracias por escribirnos.`;
-
-    appendMessage(lead, "bot", reply);
-    upsertConversationFile(lead);
-
-    await sendWhatsApp(from, reply);
-    return;
-  }
 
     await doHandoff({ lead, incoming, reasonTag: type });
 
@@ -678,11 +652,11 @@ async function processInbound({ incoming, from, lead }) {
       if (rec && typeof rec.reply === "string" && rec.reply.trim()) {
         reply = rec.reply.trim();
       } else {
-        reply = "Disculpá, me faltó un dato para orientarte bien. ¿Para qué ambiente serían: living, dormitorio u oficina?";
+        reply = "Disculpá, se me cortó una parte. ¿Para qué ambiente sería: living, dormitorio u oficina?";
       }
     } catch (e2) {
       console.log("recoveryReply failed:", e2?.message || e2);
-      reply = "Disculpá, me faltó un dato para orientarte bien. ¿Para qué ambiente serían: living, dormitorio u oficina?";
+      reply = "Disculpá, se me cortó una parte. ¿Para qué ambiente sería: living, dormitorio u oficina?";
     }
   }
 
