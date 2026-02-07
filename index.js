@@ -1,4 +1,4 @@
-// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints
+// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints (TEXT)
 // - Responds 200 OK immediately (prevents Twilio 11200 timeouts)
 // - Replies to the lead via Twilio API in background
 // - DEV_MODE=true suppresses ALL outbound messages by default (no quota usage)
@@ -47,10 +47,11 @@ app.get("/health", (req, res) =>
     reply_to_lead_in_dev: REPLY_TO_LEAD_IN_DEV,
     has_openai_key: Boolean(process.env.OPENAI_API_KEY),
     has_twilio_sid: Boolean(process.env.TWILIO_ACCOUNT_SID),
+    debug_token_set: Boolean(DEBUG_TOKEN),
   })
 );
 
-// ======= Folders (ephemeral on Render, still useful in Logs) =======
+// ======= Folders (ephemeral on Render, still useful locally) =======
 const CONV_DIR = path.join(__dirname, "conversations");
 const LEADS_DIR = path.join(__dirname, "leads");
 for (const dir of [CONV_DIR, LEADS_DIR]) {
@@ -123,12 +124,12 @@ function buildTranscript(lead) {
     `- handedOff: ${lead.handedOff}\n` +
     `- pendingHandoff: ${lead.pendingHandoff ? JSON.stringify(lead.pendingHandoff) : "null"}\n\n`;
 
-  const body = lead.messages.map((m) => `[${m.ts}] ${m.from}: ${m.text}`).join("\n");
+  const body = (lead.messages || []).map((m) => `[${m.ts}] ${m.from}: ${m.text}`).join("\n");
   return header + body + "\n";
 }
 
 function upsertConversationFile(lead) {
-  const phoneSafe = sanitizeForFilename(lead.phone.replace("+", ""));
+  const phoneSafe = sanitizeForFilename(String(lead.phone || "").replace("+", ""));
   const fpath = path.join(CONV_DIR, `${phoneSafe}.txt`);
   fs.writeFileSync(fpath, buildTranscript(lead), "utf8");
   return fpath;
@@ -136,7 +137,7 @@ function upsertConversationFile(lead) {
 
 function saveLeadSnapshot(lead, tag = "handoff") {
   const ts = filenameTs(new Date());
-  const phoneSafe = sanitizeForFilename(lead.phone.replace("+", ""));
+  const phoneSafe = sanitizeForFilename(String(lead.phone || "").replace("+", ""));
   const nameSafe = sanitizeForFilename(lead.name || "sin_nombre");
   const zoneSafe = sanitizeForFilename(lead.zone || "sin_zona");
   const fname = `${ts}_${tag}_${phoneSafe}_${nameSafe}_${zoneSafe}.txt`;
@@ -152,16 +153,11 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-function canSendOutbound() {
-  // DEV_MODE: suppress outbound unless explicitly allowed
-  if (!DEV_MODE) return true;
-  return REPLY_TO_LEAD_IN_DEV;
-}
-
 async function sendWhatsApp(toWhatsApp, body) {
   if (!toWhatsApp) return;
 
-  if (DEV_MODE) {
+  // DEV_MODE: suppress outbound unless explicitly allowed
+  if (DEV_MODE && !REPLY_TO_LEAD_IN_DEV) {
     console.log("DEV_MODE: outbound suppressed. Would send to:", toWhatsApp, "Body:", body);
     return;
   }
@@ -173,58 +169,104 @@ async function sendWhatsApp(toWhatsApp, body) {
   });
 }
 
-// ======= Debug endpoints (optional) =======
+// ======= Debug endpoints (TEXT) =======
 function requireDebugToken(req, res) {
   if (!DEBUG_TOKEN) return true; // if not set, it's open
   const t = String(req.query.token || req.headers["x-debug-token"] || "");
   if (t !== DEBUG_TOKEN) {
-    res.status(401).json({ ok: false, error: "unauthorized" });
+    res.status(401).type("text/plain").send("unauthorized\n");
     return false;
   }
   return true;
 }
 
-app.get("/debug/leads", (req, res) => {
+function lastMessageMeta(lead) {
+  const msgs = lead.messages || [];
+  const last = msgs.length ? msgs[msgs.length - 1] : null;
+  return {
+    lastAt: last ? last.ts : lead.createdAt,
+    lastFrom: last ? last.from : "",
+    lastText: last ? last.text : "",
+  };
+}
+
+function formatLeadSummary(lead) {
+  const { lastAt, lastFrom, lastText } = lastMessageMeta(lead);
+  return [
+    `phone: ${lead.phone}`,
+    `name: ${lead.name || "sin_nombre"}`,
+    `zone: ${lead.zone || "sin_zona"}`,
+    `handedOff: ${Boolean(lead.handedOff)}`,
+    `pendingHandoff: ${lead.pendingHandoff ? JSON.stringify(lead.pendingHandoff) : "null"}`,
+    `messages: ${(lead.messages || []).length}`,
+    `lastAt: ${lastAt || ""}`,
+    `lastFrom: ${lastFrom || ""}`,
+    `lastText: ${String(lastText || "").replace(/\s+/g, " ").slice(0, 140)}`,
+  ].join(" | ");
+}
+
+function pickLastLead() {
+  const all = Object.values(leads);
+  if (!all.length) return null;
+
+  all.sort((a, b) => {
+    const at = (a.messages || []).length ? a.messages[a.messages.length - 1].ts : a.createdAt;
+    const bt = (b.messages || []).length ? b.messages[b.messages.length - 1].ts : b.createdAt;
+    return String(bt).localeCompare(String(at));
+  });
+
+  return all[0];
+}
+
+function findLeadByPhoneParam(phoneParam) {
+  const raw = String(phoneParam || "").trim();
+  if (!raw) return null;
+
+  // Permit: whatsapp:+549..., +549..., 549...
+  let cleaned = raw.replace(/^whatsapp:/i, "").trim();
+  cleaned = cleaned.replace(/[^\d+]/g, "");
+
+  // Our normalizePhone keeps +digits (no whatsapp:)
+  const a = cleaned.startsWith("+") ? cleaned : `+${cleaned}`;
+  const b = a.replace("+", "");
+
+  return leads[a] || leads[b] || null;
+}
+
+app.get("/debug/leads.txt", (req, res) => {
   if (!requireDebugToken(req, res)) return;
 
-  const items = Object.values(leads).map((l) => ({
-    phone: l.phone,
-    name: l.name || "",
-    zone: l.zone || "",
-    createdAt: l.createdAt,
-    handedOff: Boolean(l.handedOff),
-    pendingHandoff: l.pendingHandoff || null,
-    messagesCount: (l.messages || []).length,
-    lastAt: (l.messages || []).length ? l.messages[l.messages.length - 1].ts : null,
-    lastFrom: (l.messages || []).length ? l.messages[l.messages.length - 1].from : null,
-    lastText: (l.messages || []).length ? l.messages[l.messages.length - 1].text : null,
-  }));
+  const all = Object.values(leads);
+  const lines = all
+    .map((l) => ({ l, meta: lastMessageMeta(l) }))
+    .sort((x, y) => String(y.meta.lastAt || "").localeCompare(String(x.meta.lastAt || "")))
+    .map(({ l }) => formatLeadSummary(l));
 
-  items.sort((a, b) => String(b.lastAt || "").localeCompare(String(a.lastAt || "")));
-  res.json({ ok: true, count: items.length, leads: items });
+  res
+    .status(200)
+    .type("text/plain; charset=utf-8")
+    .send(lines.length ? lines.join("\n") + "\n" : "no leads yet\n");
 });
 
-app.get("/debug/conversation", (req, res) => {
+app.get("/debug/last.txt", (req, res) => {
+  if (!requireDebugToken(req, res)) return;
+
+  const lead = pickLastLead();
+  if (!lead) return res.status(404).type("text/plain").send("no leads yet\n");
+
+  res.status(200).type("text/plain; charset=utf-8").send(buildTranscript(lead));
+});
+
+app.get("/debug/conversation.txt", (req, res) => {
   if (!requireDebugToken(req, res)) return;
 
   const phone = String(req.query.phone || "").trim();
-  if (!phone) return res.status(400).json({ ok: false, error: "missing ?phone=..." });
+  if (!phone) return res.status(400).type("text/plain").send("missing ?phone=...\n");
 
-  const lead = leads[phone];
-  if (!lead) return res.status(404).json({ ok: false, error: "lead_not_found" });
+  const lead = findLeadByPhoneParam(phone);
+  if (!lead) return res.status(404).type("text/plain").send("lead_not_found\n");
 
-  res.json({
-    ok: true,
-    lead: {
-      phone: lead.phone,
-      name: lead.name || "",
-      zone: lead.zone || "",
-      createdAt: lead.createdAt,
-      handedOff: Boolean(lead.handedOff),
-      pendingHandoff: lead.pendingHandoff || null,
-    },
-    messages: lead.messages || [],
-  });
+  res.status(200).type("text/plain; charset=utf-8").send(buildTranscript(lead));
 });
 
 // ======= AI: lead signals (name/zone) =======
@@ -451,7 +493,7 @@ async function processInbound({ incoming, from, lead }) {
     }
   }
 
-  // If handoff already happened: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
+  // If handoff already happened: minimal reply, optionally forward to HANDOFF_TO
   if (lead.handedOff) {
     const reply = `¡Gracias${lead.name ? `, ${lead.name}` : ""}! Ya se lo pasé al asesor 🙌`;
 
