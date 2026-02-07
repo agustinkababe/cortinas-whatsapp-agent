@@ -161,7 +161,7 @@ function canSendOutbound() {
 async function sendWhatsApp(toWhatsApp, body) {
   if (!toWhatsApp) return;
 
-  if (!canSendOutbound()) {
+  if (DEV_MODE) {
     console.log("DEV_MODE: outbound suppressed. Would send to:", toWhatsApp, "Body:", body);
     return;
   }
