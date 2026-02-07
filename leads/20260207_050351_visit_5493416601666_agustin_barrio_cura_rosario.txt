@@ -1,0 +1,21 @@
+LEAD
+- phone: +5493416601666
+- name: Agustin
+- zone: Barrio Cura, Rosario
+- createdAt: 2026-02-07T08:00:46.647Z
+- handedOff: true
+- pendingHandoff: null
+
+[2026-02-07T08:00:46.655Z] lead: Hola, como va?
+[2026-02-07T08:00:52.200Z] bot: Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?
+[2026-02-07T08:01:01.461Z] lead: estoy buscando cortinas para mi casa
+[2026-02-07T08:01:10.859Z] bot: ¡Genial! Trabajamos a medida con rollers, textiles y bandas verticales. Para casa suelen funcionar muy bien los roller: screen (dejan pasar luz y dan privacidad de día) o blackout (oscurecen). ¿Para qué ambiente las necesitás?
+[2026-02-07T08:01:28.833Z] lead: para el living comedor seria
+[2026-02-07T08:01:45.865Z] bot: Para living-comedor suelen ir muy bien los roller screen (dejan pasar luz y dan privacidad de día). Si te molestan los reflejos o querés oscurecer para TV, podés sumar blackout o un doble roller (screen + blackout). ¿Qué te importa más ahí: luz natural, privacidad o oscurecer?
+[2026-02-07T08:02:07.704Z] lead: dejar luz cuando quiero y oscurecer cuando quiero
+[2026-02-07T08:02:27.379Z] bot: Perfecto: es para living‑comedor y querés luz natural u oscurecer según el momento. La opción más práctica es el doble roller (screen + blackout en el mismo soporte): de día usás el screen y cuando querés oscuridad total bajás el blackout. Alternativa: roller screen + cortina textil blackout delante para un look más decorativo. ¿Te gusta más el doble roller o la combinación con cortina textil?
+[2026-02-07T08:02:57.579Z] lead: no tengo idea, deberia ver algunos ejemplos
+[2026-02-07T08:03:16.716Z] bot: Claro, podemos mostrarte ejemplos. Tenés dos opciones: pasar por el showroom (Bv. Avellaneda Bis 235, de 8 a 17) para ver rollers screen/blackout y dobles instalados, o coordinar una medición sin cargo y llevamos muestras para probar en tu living con tu luz. ¿Qué te queda más cómodo, showroom o coordinar visita?
+[2026-02-07T08:03:31.864Z] lead: coordinemos una visita si
+[2026-02-07T08:03:33.767Z] bot: Dale 🙂 Antes de pasarte con un asesor, ¿me decís tu nombre y en qué zona/barrio estás?
+[2026-02-07T08:03:46.618Z] lead: si soy Agustin estoy en Barrio Cura, en Rosario
