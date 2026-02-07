@@ -218,6 +218,35 @@ app.get("/debug/conversation", (req, res) => {
   });
 });
 
+app.get("/debug/last.txt", (req, res) => {
+  if (!requireDebugToken(req, res)) return;
+
+  const all = Object.values(leads || {});
+  if (!all.length) {
+    res.set("Content-Type", "text/plain; charset=utf-8");
+    return res.status(200).send("No leads in memory yet.\n");
+  }
+
+  // pick lead with newest message timestamp
+  let latest = null;
+  for (const l of all) {
+    const msgs = l.messages || [];
+    const lastTs = msgs.length ? msgs[msgs.length - 1].ts : null;
+    if (!latest) {
+      latest = { lead: l, lastTs };
+      continue;
+    }
+    const bestTs = latest.lastTs || "";
+    if ((lastTs || "") > bestTs) latest = { lead: l, lastTs };
+  }
+
+  const lead = latest.lead;
+  const txt = buildTranscript(lead);
+
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  return res.status(200).send(txt);
+});
+
 // ======= AI: lead signals (name/zone) =======
 async function extractLeadSignals({ incoming, lead }) {
   const needName = !lead.name;
