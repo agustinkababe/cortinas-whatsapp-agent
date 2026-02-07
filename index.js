@@ -489,9 +489,55 @@ function askForMissingLeadData(lead) {
   return "Perfecto 🙂 ¿en qué zona/barrio estás (Rosario o alrededores)?";
 }
 
+function extractByRegex(incoming) {
+  const text = String(incoming || "").trim();
+
+  // NAME: si el mensaje ES solo un nombre (ej: "Agustin")
+  let name = "";
+  if (/^[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}){0,2}$/.test(text)) {
+    name = text;
+  }
+
+  // NAME: "soy Agustin", "me llamo Agustin", "mi nombre es Agustin"
+  const m1 = text.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2})/i);
+  if (!name && m1?.[1]) name = m1[1].trim();
+
+  // ZONE: "estoy en barrio cura en rosario", "vivo en fisherton", "soy de rosario"
+  let zone = "";
+  const m2 = text.match(/\b(?:estoy en|vivo en|soy de)\s+(.+)$/i);
+  if (m2?.[1]) zone = m2[1].trim();
+
+  if (zone) {
+    zone = zone
+      .replace(/[.!,;]+$/g, "")
+      .trim()
+      .slice(0, 80);
+  }
+
+  return { name, zone };
+}
+
+function applySignalsToLead(lead, sig) {
+  if (!sig) return;
+  if (!lead.name && sig.name) lead.name = String(sig.name).trim();
+  if (!lead.zone && sig.zone) lead.zone = String(sig.zone).trim();
+}
+
 // ======= Main processing (async, after FAST_ACK) =======
 async function processInbound({ incoming, from, lead }) {
-  // Intents that trigger handoff
+  // 0) Regex extraction ALWAYS (instant, no timeouts)
+  try {
+    const quick = extractByRegex(incoming);
+    applySignalsToLead(lead, quick);
+    upsertConversationFile(lead);
+
+    // opcional: para debug fino
+    console.log("SIGNALS quick:", quick, "lead now:", { name: lead.name, zone: lead.zone });
+  } catch (e) {
+    console.log("extractByRegex/applySignals error:", e?.message || e);
+  }
+
+  // 1) Intents that trigger handoff
   const budgetIntent = /presupuesto|cotiz|precio|cu[aá]nto|vale|valor/i.test(incoming);
   const visitIntent =
     /visita|agendar|agenda|coordinar|coordinemos|medir|medición|relevamiento|cuando\s+podr[ií]an\s+pasar|cu[aá]ndo\s+podr[ií]an\s+pasar/i.test(
@@ -501,19 +547,20 @@ async function processInbound({ incoming, from, lead }) {
 
   const needsHandoff = budgetIntent || visitIntent || humanIntent || (lead.pendingHandoff && !lead.handedOff);
 
-  // If we need name/zone for handoff flow, try a fast extraction (timeout-protected)
+  // 2) If we need name/zone for handoff flow, try AI extraction as backup (timeout-protected)
   if (needsHandoff && (!lead.name || !lead.zone)) {
     try {
-      const sig = await withTimeout(extractLeadSignals({ incoming, lead }), 2000);
-      if (!lead.name && sig.name) lead.name = sig.name;
-      if (!lead.zone && sig.zone) lead.zone = sig.zone;
+      const sig = await withTimeout(extractLeadSignals({ incoming, lead }), 2500);
+      applySignalsToLead(lead, sig);
       upsertConversationFile(lead);
+
+      console.log("SIGNALS ai:", sig, "lead now:", { name: lead.name, zone: lead.zone });
     } catch (e) {
       console.log("extractLeadSignals timeout/err:", e?.message || e);
     }
   }
 
-  // Pending handoff: continue collecting
+  // 3) Pending handoff: continue collecting
   if (lead.pendingHandoff && !lead.handedOff) {
     if (lead.name && lead.zone) {
       const type = lead.pendingHandoff.type;
@@ -541,7 +588,7 @@ async function processInbound({ incoming, from, lead }) {
     }
   }
 
-  // After handoff: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
+  // 4) After handoff: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
   if (lead.handedOff) {
     const reply = `¡Gracias${lead.name ? `, ${lead.name}` : ""}! Ya se lo pasé al asesor 🙌`;
 
@@ -563,7 +610,7 @@ async function processInbound({ incoming, from, lead }) {
     return;
   }
 
-  // New handoff intent
+  // 5) New handoff intent
   if (budgetIntent || visitIntent || humanIntent) {
     const type = visitIntent ? "visit" : budgetIntent ? "budget" : "human";
 
@@ -591,7 +638,7 @@ async function processInbound({ incoming, from, lead }) {
     return;
   }
 
-  // Otherwise: AI assists (timeout-protected) + recovery fallback
+  // 6) Otherwise: AI assists (timeout-protected) + recovery fallback
   let reply = "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
 
   try {
