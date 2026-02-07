@@ -1,11 +1,7 @@
-// index.js — FINAL (v2: name+zone before handoff, no photos)
-// - dotenv (.env) for config
-// - AI extraction for name/zone
-// - Lead-gen prompt (NO pide fotos)
-// - Handoff ONLY when: budgetIntent OR visitIntent OR humanIntent
-// - Before handoff: MUST have name + zone (asks missing, then auto-handoff)
-// - DEV_MODE=true: suppress Twilio outbound; still saves snapshots/logs
-// - After handoff: forwards new lead messages only if DEV_MODE=false
+// index.js — FINAL (v2: name+zone before handoff, no photos) + Render-ready
+// - Adds / and /health endpoints for Render checks
+// - Logs inbound webhook payload to Render Logs
+// - Uses process.env.PORT for Render
 
 require("dotenv").config();
 
@@ -28,6 +24,17 @@ const bodyParser = require("body-parser");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
+
+// ======= Health endpoints (Render checks) =======
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) =>
+  res.status(200).json({
+    ok: true,
+    dev_mode: DEV_MODE,
+    has_openai_key: Boolean(process.env.OPENAI_API_KEY),
+    has_twilio_sid: Boolean(process.env.TWILIO_ACCOUNT_SID),
+  })
+);
 
 // ======= Folders =======
 const CONV_DIR = path.join(__dirname, "conversations");
@@ -218,37 +225,28 @@ OFERTA
   RESUMEN 1-LÍNEA (para que se sienta escuchado)
   - Cuando el cliente ya dio datos concretos (ambiente + prioridad, o cantidad de ventanas, o medidas),
     empezá tu respuesta con UN resumen de 1 línea confirmando lo entendido.
-    Ejemplos:
-    - “Perfecto: es para oficina y querés oscurecer para evitar reflejos.”
-    - “Genial: son 12 ventanas en 5 salas, y el foco es oscurecer durante el día.”
-    - “Dale: 3 m de ancho x 2 m de alto, buscando blackout.”
-  - No hagas este resumen en el primer mensaje ni en todos los mensajes: usalo cada 3–4 turnos o al cambiar de etapa (de asesoramiento a “cómo seguimos”).
+  - No hagas este resumen en el primer mensaje ni en todos los mensajes: usalo cada 3–4 turnos o al cambiar de etapa.
 
   SEÑALES DE “PROYECTO REAL” (cuando conviene sugerir medición)
   Si el cliente menciona cualquiera de estos:
-  - cantidad de ambientes/ventanas (ej: “12 ventanas”, “4 salas”)
+  - cantidad de ambientes/ventanas
   - medidas
   - intención de avanzar (“¿cómo seguimos?”, “dale”, “quiero hacerlo”)
-  - contexto empresa/oficina y ya hubo 2+ intercambios sobre el caso
-  Entonces, en lugar de seguir listando opciones o repetir beneficios,
-  sugerí medición sin cargo como siguiente paso:
-  - “Para no adivinar, lo ideal es coordinar una medición sin cargo y te asesoramos ahí. ¿Querés que lo agendemos?”
+  - contexto empresa/oficina y ya hubo 2+ intercambios
+  Entonces sugerí medición sin cargo como siguiente paso (sin repetir beneficios).
 
   Si el cliente pide “ver ejemplos” o “no tengo idea”:
-  - Ofrecé 2 opciones, sin inventar nada fuera de FACTS:
-    1) “Podés pasar por el showroom (Bv. Avellaneda Bis 235) en horario 8 a 17.”
-    2) “O coordinamos una medición/relevamiento a domicilio sin cargo y te asesoramos en el lugar.”
-  - Cerrá con una sola pregunta: “¿Qué te queda más cómodo: showroom o coordinar visita?”
+  - Showroom (Bv. Avellaneda Bis 235) de 8 a 17
+  - O medición/relevamiento a domicilio sin cargo
+  - Cerrá con “¿Qué te queda más cómodo: showroom o coordinar visita?”
   
-  EVITAR REPETICIÓN (muy importante)
-  - No repitas “100% a medida / medición sin cargo / entrega 7–21 días / envíos” más de 1 vez cada 4 mensajes.
-  - Si ya lo mencionaste recientemente, no lo repitas salvo que el cliente pregunte o sea clave para cerrar.
-  - Alterná: a veces cerrá con una pregunta simple (ambiente/prioridad) y listo.
+  EVITAR REPETICIÓN
+  - No repitas beneficios más de 1 vez cada 4 mensajes.
   
-  PREGUNTAS ÚTILES (elegí solo 1 por mensaje)
-  - Ambiente: living / dormitorio / oficina / cocina
-  - Prioridad: oscurecer / privacidad / luz natural / reflejos / decorativo
-  - Tipo: roller (screen / blackout) / textil / bandas verticales
+  PREGUNTAS ÚTILES (solo 1)
+  - Ambiente
+  - Prioridad
+  - Tipo
   
   PRIMER MENSAJE
   “Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?”
@@ -257,8 +255,7 @@ OFERTA
   ${FACTS}
   
   SALIDA
-  SOLO JSON válido:
-  {"reply":"...", "needs_human": true/false}
+  SOLO JSON: {"reply":"...", "needs_human": true/false}
 `;
 
   const recent = (lead?.messages || [])
@@ -352,12 +349,18 @@ function askForMissingLeadData(lead) {
   if (missingName) {
     return "Dale 🙂 Antes de pasarte con un asesor, ¿me decís tu nombre?";
   }
-  // missingZone only
   return "Perfecto 🙂 ¿en qué zona/barrio estás (Rosario o alrededores)?";
 }
 
 // ======= Webhook =======
 app.post("/whatsapp", async (req, res) => {
+  // Render-friendly inbound log:
+  console.log("INBOUND /whatsapp", {
+    at: new Date().toISOString(),
+    from: req.body.From,
+    body: req.body.Body,
+  });
+
   const incoming = String(req.body.Body || "").trim();
   const from = req.body.From || "";
   const phone = normalizePhone(from);
@@ -467,7 +470,6 @@ app.post("/whatsapp", async (req, res) => {
       return res.send(`<Response><Message>${ask}</Message></Response>`);
     }
 
-    // already have both -> handoff now
     const header =
       type === "visit"
         ? "📅 HANDOFF (visita/medición)"
@@ -510,7 +512,9 @@ app.post("/whatsapp", async (req, res) => {
   return res.send(`<Response><Message>${reply}</Message></Response>`);
 });
 
-app.listen(3000, () => {
-  console.log("Webhook listo: http://localhost:3000/whatsapp");
+// ======= Listen (Render uses PORT) =======
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Webhook listo en puerto ${PORT}`);
   console.log("DEV_MODE =", DEV_MODE);
 });
