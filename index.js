@@ -1,10 +1,12 @@
-// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints (AI-only state)
+// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints (AI-only state) + Low-latency AI
 // - Responds 200 OK immediately (prevents Twilio 11200 timeouts)
 // - Replies to the lead via Twilio API in background
 // - DEV_MODE=true suppresses ALL outbound messages (no quota usage) but still logs + debug endpoints
 // - NO REGEX for name/zone/intents: AI extracts + drives conversation
 // - Handoff only when user explicitly asks for price/budget OR to coordinate a visit/measurement
-// - Never handoff unless we have: (1) what the lead wants, (2) name, (3) zone
+// - Never handoff unless we have: (1) what the lead wants (intentSummary), (2) name, (3) zone
+// - Fixes timeouts: greet-shortcut (no AI), smaller model, shorter context, 1 retry with even smaller context/model
+// - Pending handoff: if user asked earlier and we were collecting missing fields, complete handoff once ready
 
 require("dotenv").config();
 
@@ -31,6 +33,10 @@ const DEV_MODE = String(process.env.DEV_MODE || "true").toLowerCase() === "true"
 const FAST_ACK = String(process.env.FAST_ACK || "true").toLowerCase() === "true";
 const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
 
+// AI models (fast defaults)
+const AI_MODEL_MAIN = process.env.AI_MODEL_MAIN || "gpt-5-mini";
+const AI_MODEL_RETRY = process.env.AI_MODEL_RETRY || "gpt-5-nano";
+
 // ======= Health endpoints =======
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) =>
@@ -42,6 +48,8 @@ app.get("/health", (req, res) =>
     has_twilio_sid: Boolean(process.env.TWILIO_ACCOUNT_SID),
     has_handoff_to: Boolean(HANDOFF_TO),
     debug_token_set: Boolean(DEBUG_TOKEN),
+    ai_model_main: AI_MODEL_MAIN,
+    ai_model_retry: AI_MODEL_RETRY,
   })
 );
 
@@ -99,7 +107,8 @@ function getLead(phone) {
       messages: [],
       createdAt: nowTs(),
       handedOff: false,
-      pendingHandoff: null, // { type: "visit"|"price", requestedAt: ts }
+      // pendingHandoff: { type: "visit"|"price", requestedAt: ts }
+      pendingHandoff: null,
     };
   }
   return leads[phone];
@@ -163,6 +172,57 @@ async function sendWhatsApp(toWhatsApp, body) {
     to: toWhatsApp,
     body,
   });
+}
+
+function safeHandoffType(t) {
+  return t === "visit" || t === "price" ? t : null;
+}
+
+// Basic short greeting detection (NO REGEX extractions; just avoid AI call on trivial greetings)
+function isTrivialGreeting(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return true;
+  // very short message -> treat as greeting / opener to avoid AI latency
+  if (t.length <= 3) return true;
+  // common greetings
+  const greetings = [
+    "hola",
+    "holaa",
+    "holaaa",
+    "buenas",
+    "buen día",
+    "buen dia",
+    "buenos días",
+    "buenos dias",
+    "buenas tardes",
+    "buenas noches",
+    "hello",
+    "hi",
+    "hey",
+    "👋",
+  ];
+  return greetings.includes(t);
+}
+
+function askMissingForHandoff(lead) {
+  // One question max. If two fields missing, ask both in one sentence.
+  const missingName = !lead.name;
+  const missingZone = !lead.zone;
+  const missingIntent = !lead.intentSummary;
+
+  // Priority: intentSummary first (what wants) because you explicitly asked for it before handoff.
+  if (missingIntent && (missingName || missingZone)) {
+    return "Perfecto 🙂 Antes de derivarte, ¿me contás brevemente qué estás buscando (tipo de cortina y para qué ambiente) y tu nombre + zona/barrio?";
+  }
+  if (missingIntent) {
+    return "Perfecto 🙂 Antes de derivarte, ¿me contás brevemente qué estás buscando (tipo de cortina y para qué ambiente)?";
+  }
+  if (missingName && missingZone) {
+    return "Dale 🙂 Antes de pasarte con un asesor, ¿me decís tu nombre y en qué zona/barrio estás?";
+  }
+  if (missingName) return "Dale 🙂 Antes de pasarte con un asesor, ¿me decís tu nombre?";
+  if (missingZone) return "Perfecto 🙂 ¿En qué zona/barrio estás (Rosario o alrededores)?";
+  return "Perfecto 🙂";
 }
 
 // ======= Debug endpoints (optional) =======
@@ -241,7 +301,9 @@ app.get("/debug/last.txt", (req, res) => {
 });
 
 // ======= AI Brain (single call returns reply + state updates + handoff intent) =======
-async function aiDecideAndReply({ incoming, lead }) {
+async function aiDecideAndReply({ incoming, lead, opts }) {
+  const { model, historyN } = opts;
+
   const FACTS = `
 EMPRESA
 - Nombre comercial: Cortinas Argentinas
@@ -258,7 +320,7 @@ OFERTA
 `;
 
   const recent = (lead?.messages || [])
-    .slice(-14)
+    .slice(-historyN)
     .map((m) => `${m.from === "lead" ? "Cliente" : m.from === "bot" ? "Asistente" : "Sistema"}: ${m.text}`)
     .join("\n");
 
@@ -283,13 +345,13 @@ TU TRABAJO (en una sola respuesta JSON):
 3) Detectar si el cliente pidió EXPLÍCITAMENTE:
    - handoff_intent = "price" si pide precio/presupuesto/cotización.
    - handoff_intent = "visit" si pide coordinar visita/medición/relevamiento/agendar.
-   - handoff_intent = "none" en cualquier otro caso (incluye cuando el bot sugirió visita y el cliente solo dijo "dale" sin pedir coordinar).
+   - handoff_intent = "none" en cualquier otro caso.
 4) Si handoff_intent != "none", antes de derivar necesitamos 3 cosas:
    - intentSummary NO vacío
    - name NO vacío
    - zone NO vacío
-   Si falta algo, NO derivar. En ese caso, reply debe pedir SOLO lo que falta, en un tono cordial y sin perder el hilo.
-   Si están las 3 cosas, reply debe confirmar derivación (sin pedir más datos) y agradecer.
+   Si falta algo, NO derivar. En ese caso, reply debe pedir SOLO lo que falta, cordial, 1 pregunta máximo.
+   Si están las 3 cosas, reply debe confirmar derivación y agradecer (sin pedir más datos).
 
 REGLAS DE ESTILO:
 - WhatsApp, humano, breve.
@@ -313,7 +375,7 @@ SALIDA: SOLO JSON válido, sin texto extra:
 `;
 
   const r = await openai.responses.create({
-    model: "gpt-5",
+    model,
     reasoning: { effort: "low" },
     instructions,
     input: `FACTS:\n${FACTS}\n\nESTADO_ACTUAL:\n${JSON.stringify(state)}\n\nHISTORIAL_RECIENTE:\n${recent}\n\nMENSAJE_CLIENTE:\n${incoming}`,
@@ -325,12 +387,18 @@ SALIDA: SOLO JSON válido, sin texto extra:
   if (start < 0 || end <= start) throw new Error("ai_output_not_json");
 
   const parsed = JSON.parse(text.slice(start, end + 1));
+
+  const handoff_intent =
+    parsed.handoff_intent === "price" || parsed.handoff_intent === "visit" || parsed.handoff_intent === "none"
+      ? parsed.handoff_intent
+      : "none";
+
   return {
     reply: typeof parsed.reply === "string" ? parsed.reply.trim() : "",
     name: typeof parsed.name === "string" ? parsed.name.trim() : "",
     zone: typeof parsed.zone === "string" ? parsed.zone.trim() : "",
     intentSummary: typeof parsed.intentSummary === "string" ? parsed.intentSummary.trim() : "",
-    handoff_intent: parsed.handoff_intent,
+    handoff_intent,
   };
 }
 
@@ -368,7 +436,7 @@ async function doHandoff({ lead, incoming, reasonTag }) {
 
 // ======= Main processing (async after FAST_ACK) =======
 async function processInbound({ incoming, from, lead }) {
-  // If already handed off: acknowledge + optionally forward to HANDOFF_TO
+  // 0) If already handed off: acknowledge + optionally forward to HANDOFF_TO
   if (lead.handedOff) {
     const reply = `¡Gracias${lead.name ? `, ${lead.name}` : ""}! Ya se lo pasé al asesor 🙌`;
     appendMessage(lead, "bot", reply);
@@ -390,51 +458,118 @@ async function processInbound({ incoming, from, lead }) {
     return;
   }
 
-  // AI decides reply + extracts state + detects explicit handoff intent
-  let out;
-  try {
-    out = await withTimeout(aiDecideAndReply({ incoming, lead }), 9000);
-  } catch (e) {
-    console.error("aiDecideAndReply error:", e?.message || e);
-    const fallback = "Disculpá, tuve un error. ¿Me contás brevemente qué tipo de cortina buscás y para qué ambiente?";
-    appendMessage(lead, "bot", fallback);
+  // 1) If we are collecting for a previous explicit handoff request, we can complete it once ready
+  const pendingType = safeHandoffType(lead.pendingHandoff?.type);
+
+  // 2) Avoid AI call for trivial greetings/openers (reduces timeouts massively)
+  if (isTrivialGreeting(incoming)) {
+    // If we are pending a handoff and missing fields, ask what's missing instead of generic hello.
+    if (pendingType) {
+      const ask = askMissingForHandoff(lead);
+      appendMessage(lead, "bot", ask);
+      upsertConversationFile(lead);
+      await sendWhatsApp(from, ask);
+      return;
+    }
+
+    const hello = "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
+    appendMessage(lead, "bot", hello);
     upsertConversationFile(lead);
-    await sendWhatsApp(from, fallback);
+    await sendWhatsApp(from, hello);
     return;
   }
 
-  // Apply state updates (only if non-empty)
+  // 3) AI decides reply + extracts state + detects explicit handoff intent
+  let out = null;
+
+  try {
+    out = await withTimeout(
+      aiDecideAndReply({
+        incoming,
+        lead,
+        opts: { model: AI_MODEL_MAIN, historyN: 8 },
+      }),
+      6500
+    );
+  } catch (e1) {
+    console.error("aiDecideAndReply main error:", e1?.message || e1);
+    // One retry: shorter context + faster model
+    try {
+      out = await withTimeout(
+        aiDecideAndReply({
+          incoming,
+          lead,
+          opts: { model: AI_MODEL_RETRY, historyN: 4 },
+        }),
+        4500
+      );
+    } catch (e2) {
+      console.error("aiDecideAndReply retry error:", e2?.message || e2);
+      const fallback =
+        pendingType
+          ? askMissingForHandoff(lead)
+          : "Disculpá, tuve un problema técnico. ¿Me contás brevemente qué tipo de cortina buscás y para qué ambiente?";
+      appendMessage(lead, "bot", fallback);
+      upsertConversationFile(lead);
+      await sendWhatsApp(from, fallback);
+      return;
+    }
+  }
+
+  // 4) Apply state updates (only if non-empty; never overwrite existing)
   if (!lead.name && out.name) lead.name = out.name;
   if (!lead.zone && out.zone) lead.zone = out.zone;
   if (!lead.intentSummary && out.intentSummary) lead.intentSummary = out.intentSummary;
 
   upsertConversationFile(lead);
 
-  // Determine if handoff should occur now
-  const handoffIntent = out.handoff_intent;
-  const needsHandoff = handoffIntent === "price" || handoffIntent === "visit";
+  // 5) Determine if we should handoff:
+  // - either the user explicitly asked now (out.handoff_intent)
+  // - or we are in a pendingHandoff flow from an earlier explicit request
+  const aiHandoff = safeHandoffType(out.handoff_intent === "price" ? "price" : out.handoff_intent === "visit" ? "visit" : null);
+  const activeHandoffType = pendingType || aiHandoff;
 
-  // If AI says explicit handoff intent, we require 3 fields before doing it
-  if (needsHandoff) {
-    // If still missing any required info, we DO NOT handoff; we just send the AI reply (which must ask for missing)
-    const ready = Boolean(lead.name && lead.zone && lead.intentSummary);
+  if (activeHandoffType) {
+    const ready = Boolean(lead.intentSummary && lead.name && lead.zone);
 
-    appendMessage(lead, "bot", out.reply || "Perfecto 🙂 ¿Me decís tu nombre y en qué zona estás?");
-    upsertConversationFile(lead);
-    await sendWhatsApp(from, out.reply || "Perfecto 🙂 ¿Me decís tu nombre y en qué zona estás?");
+    if (!ready) {
+      // We do NOT handoff. Ensure we remember pending and ask missing info.
+      if (!lead.pendingHandoff) {
+        lead.pendingHandoff = { type: activeHandoffType, requestedAt: nowTs() };
+      }
 
-    if (ready) {
-      await doHandoff({ lead, incoming, reasonTag: handoffIntent });
-    } else {
-      // remember pending intent (optional)
-      lead.pendingHandoff = { type: handoffIntent, requestedAt: nowTs() };
+      // Prefer AI reply if it exists; otherwise deterministic ask for missing.
+      const reply = (out.reply && out.reply.trim()) ? out.reply.trim() : askMissingForHandoff(lead);
+
+      appendMessage(lead, "bot", reply);
       upsertConversationFile(lead);
+      await sendWhatsApp(from, reply);
+      return;
     }
+
+    // Ready -> confirm to lead + perform handoff
+    // (We send a deterministic confirmation to avoid any AI mistake here.)
+    const confirm =
+      `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
+      `Gracias por escribirnos.`;
+
+    appendMessage(lead, "bot", confirm);
+    upsertConversationFile(lead);
+    await sendWhatsApp(from, confirm);
+
+    // clear pending and handoff
+    lead.pendingHandoff = null;
+    upsertConversationFile(lead);
+
+    await doHandoff({ lead, incoming, reasonTag: activeHandoffType });
     return;
   }
 
-  // Normal (no handoff): just reply
-  const reply = out.reply || "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
+  // 6) Normal (no handoff): reply
+  const reply =
+    (out.reply && out.reply.trim()) ||
+    "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
+
   appendMessage(lead, "bot", reply);
   upsertConversationFile(lead);
   await sendWhatsApp(from, reply);
@@ -486,4 +621,6 @@ app.listen(PORT, () => {
   console.log("DEV_MODE =", DEV_MODE);
   console.log("FAST_ACK =", FAST_ACK);
   console.log("DEBUG_TOKEN set =", Boolean(DEBUG_TOKEN));
+  console.log("AI_MODEL_MAIN =", AI_MODEL_MAIN);
+  console.log("AI_MODEL_RETRY =", AI_MODEL_RETRY);
 });
