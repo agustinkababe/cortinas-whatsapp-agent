@@ -1,11 +1,10 @@
-// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints + Recovery fallback
+// index.js — Render + Twilio timeout-proof (FAST_ACK) + Debug endpoints (AI-only state)
 // - Responds 200 OK immediately (prevents Twilio 11200 timeouts)
-// - Replies to the lead via Twilio API in background (Twilio API call)
+// - Replies to the lead via Twilio API in background
 // - DEV_MODE=true suppresses ALL outbound messages (no quota usage) but still logs + debug endpoints
-// - Debug endpoints to inspect in-memory conversations on Render (optional token)
-// - Adds recoveryReply() fallback: apologizes, summarizes context, asks 1 best next question (no conversation reset)
-// - FIX: handoff is ALWAYS gated by name+zone (pendingHandoff flow). Removes duplicated/buggy blocks.
-// - FIX: pendingHandoff flow extracts name/zone via regex first, then AI backup.
+// - NO REGEX for name/zone/intents: AI extracts + drives conversation
+// - Handoff only when user explicitly asks for price/budget OR to coordinate a visit/measurement
+// - Never handoff unless we have: (1) what the lead wants, (2) name, (3) zone
 
 require("dotenv").config();
 
@@ -18,24 +17,21 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const twilio = require("twilio");
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-const TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886";
-const HANDOFF_TO = process.env.HANDOFF_TO; // whatsapp:+549...
-
-const DEV_MODE = String(process.env.DEV_MODE || "true").toLowerCase() === "true";
-
-// FAST_ACK: reply 200 OK immediately to Twilio to avoid 11200
-const FAST_ACK = String(process.env.FAST_ACK || "true").toLowerCase() === "true";
-
-// Optional: protect debug endpoints
-const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
-
 const express = require("express");
 const bodyParser = require("body-parser");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// ======= Health endpoints (Render checks) =======
+// ======= Config =======
+const TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886";
+const HANDOFF_TO = process.env.HANDOFF_TO || ""; // whatsapp:+549...
+
+const DEV_MODE = String(process.env.DEV_MODE || "true").toLowerCase() === "true";
+const FAST_ACK = String(process.env.FAST_ACK || "true").toLowerCase() === "true";
+const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
+
+// ======= Health endpoints =======
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) =>
   res.status(200).json({
@@ -44,6 +40,7 @@ app.get("/health", (req, res) =>
     fast_ack: FAST_ACK,
     has_openai_key: Boolean(process.env.OPENAI_API_KEY),
     has_twilio_sid: Boolean(process.env.TWILIO_ACCOUNT_SID),
+    has_handoff_to: Boolean(HANDOFF_TO),
     debug_token_set: Boolean(DEBUG_TOKEN),
   })
 );
@@ -98,10 +95,11 @@ function getLead(phone) {
       phone,
       name: "",
       zone: "",
+      intentSummary: "", // what the lead wants (minimal summary)
       messages: [],
       createdAt: nowTs(),
       handedOff: false,
-      pendingHandoff: null, // { type: "visit"|"budget"|"human", lastIntentText: string }
+      pendingHandoff: null, // { type: "visit"|"price", requestedAt: ts }
     };
   }
   return leads[phone];
@@ -117,6 +115,7 @@ function buildTranscript(lead) {
     `- phone: ${lead.phone}\n` +
     `- name: ${lead.name || "sin_nombre"}\n` +
     `- zone: ${lead.zone || "sin_zona"}\n` +
+    `- intentSummary: ${lead.intentSummary || "sin_contexto"}\n` +
     `- createdAt: ${lead.createdAt}\n` +
     `- handedOff: ${lead.handedOff}\n` +
     `- pendingHandoff: ${lead.pendingHandoff ? JSON.stringify(lead.pendingHandoff) : "null"}\n\n`;
@@ -126,7 +125,7 @@ function buildTranscript(lead) {
 }
 
 function upsertConversationFile(lead) {
-  const phoneSafe = sanitizeForFilename(lead.phone.replace("+", ""));
+  const phoneSafe = sanitizeForFilename(String(lead.phone || "").replace("+", ""));
   const fpath = path.join(CONV_DIR, `${phoneSafe}.txt`);
   fs.writeFileSync(fpath, buildTranscript(lead), "utf8");
   return fpath;
@@ -134,10 +133,11 @@ function upsertConversationFile(lead) {
 
 function saveLeadSnapshot(lead, tag = "handoff") {
   const ts = filenameTs(new Date());
-  const phoneSafe = sanitizeForFilename(lead.phone.replace("+", ""));
+  const phoneSafe = sanitizeForFilename(String(lead.phone || "").replace("+", ""));
   const nameSafe = sanitizeForFilename(lead.name || "sin_nombre");
   const zoneSafe = sanitizeForFilename(lead.zone || "sin_zona");
-  const fname = `${ts}_${tag}_${phoneSafe}_${nameSafe}_${zoneSafe}.txt`;
+  const intentSafe = sanitizeForFilename(lead.intentSummary || "sin_contexto");
+  const fname = `${ts}_${tag}_${phoneSafe}_${nameSafe}_${zoneSafe}_${intentSafe}.txt`;
   const fpath = path.join(LEADS_DIR, fname);
   fs.writeFileSync(fpath, buildTranscript(lead), "utf8");
   return fpath;
@@ -153,7 +153,6 @@ function withTimeout(promise, ms) {
 async function sendWhatsApp(toWhatsApp, body) {
   if (!toWhatsApp) return;
 
-  // DEV_MODE: suppress outbound (no Twilio quota)
   if (DEV_MODE) {
     console.log("DEV_MODE: outbound suppressed. Would send to:", toWhatsApp, "Body:", body);
     return;
@@ -168,7 +167,7 @@ async function sendWhatsApp(toWhatsApp, body) {
 
 // ======= Debug endpoints (optional) =======
 function requireDebugToken(req, res) {
-  if (!DEBUG_TOKEN) return true; // if not set, it's open
+  if (!DEBUG_TOKEN) return true; // open if not set
   const t = String(req.query.token || req.headers["x-debug-token"] || "");
   if (t !== DEBUG_TOKEN) {
     res.status(401).json({ ok: false, error: "unauthorized" });
@@ -184,6 +183,7 @@ app.get("/debug/leads", (req, res) => {
     phone: l.phone,
     name: l.name || "",
     zone: l.zone || "",
+    intentSummary: l.intentSummary || "",
     createdAt: l.createdAt,
     handedOff: Boolean(l.handedOff),
     pendingHandoff: l.pendingHandoff || null,
@@ -212,6 +212,7 @@ app.get("/debug/conversation", (req, res) => {
       phone: lead.phone,
       name: lead.name || "",
       zone: lead.zone || "",
+      intentSummary: lead.intentSummary || "",
       createdAt: lead.createdAt,
       handedOff: Boolean(lead.handedOff),
       pendingHandoff: lead.pendingHandoff || null,
@@ -228,92 +229,19 @@ app.get("/debug/last.txt", (req, res) => {
 
   if (!all.length) return res.status(200).send("No leads in memory yet.\n");
 
-  // pick lead with newest message timestamp
   let latest = null;
   for (const l of all) {
     const msgs = l.messages || [];
     const lastTs = msgs.length ? msgs[msgs.length - 1].ts : "";
-    if (!latest) {
-      latest = { lead: l, lastTs };
-      continue;
-    }
-    if (lastTs > (latest.lastTs || "")) latest = { lead: l, lastTs };
+    if (!latest) latest = { lead: l, lastTs };
+    else if (lastTs > (latest.lastTs || "")) latest = { lead: l, lastTs };
   }
 
   return res.status(200).send(buildTranscript(latest.lead));
 });
 
-// ======= Lead signals (name/zone) =======
-function extractByRegex(incoming) {
-  const text = String(incoming || "").trim();
-
-  // NAME: message is only a name (e.g., "Agustin" / "Agustin Kababe")
-  let name = "";
-  if (/^[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}){0,2}$/.test(text)) {
-    name = text;
-  }
-
-  // NAME: "soy Agustin", "me llamo Agustin", "mi nombre es Agustin"
-  const m1 = text.match(
-    /\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2})/i
-  );
-  if (!name && m1?.[1]) name = m1[1].trim();
-
-  // ZONE: "estoy en barrio cura en rosario", "vivo en fisherton", "soy de rosario"
-  let zone = "";
-  const m2 = text.match(/\b(?:estoy en|vivo en|soy de)\s+(.+)$/i);
-  if (m2?.[1]) zone = m2[1].trim();
-
-  if (zone) {
-    zone = zone.replace(/[.!,;]+$/g, "").trim().slice(0, 80);
-  }
-
-  return { name, zone };
-}
-
-function applySignalsToLead(lead, sig) {
-  if (!sig) return;
-  if (!lead.name && sig.name) lead.name = String(sig.name).trim();
-  if (!lead.zone && sig.zone) lead.zone = String(sig.zone).trim();
-}
-
-// ======= AI: lead signals (name/zone) =======
-async function extractLeadSignals({ incoming, lead }) {
-  const needName = !lead.name;
-  const needZone = !lead.zone;
-  if (!needName && !needZone) return { name: "", zone: "" };
-
-  const r = await openai.responses.create({
-    model: "gpt-5",
-    reasoning: { effort: "low" },
-    instructions: `
-Extraé del mensaje SOLO estos campos si aparecen explícitos:
-- name: SOLO el nombre (o nombre+apellido si es claro). NO incluyas intención.
-- zone: SOLO la ubicación (barrio/ciudad/zona). NO incluyas intención.
-Reglas: si no es claro, devolvé "".
-Devolvé SOLO JSON: {"name":"", "zone":""}
-`,
-    input: `Mensaje: ${incoming}`,
-  });
-
-  const text = (r.output_text || "").trim();
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) return { name: "", zone: "" };
-
-  try {
-    const parsed = JSON.parse(text.slice(start, end + 1));
-    return {
-      name: typeof parsed.name === "string" ? parsed.name.trim() : "",
-      zone: typeof parsed.zone === "string" ? parsed.zone.trim() : "",
-    };
-  } catch {
-    return { name: "", zone: "" };
-  }
-}
-
-// ======= AI: reply (lead-gen prompt, NO photos) =======
-async function aiReply({ from, incoming, lead }) {
+// ======= AI Brain (single call returns reply + state updates + handoff intent) =======
+async function aiDecideAndReply({ incoming, lead }) {
   const FACTS = `
 EMPRESA
 - Nombre comercial: Cortinas Argentinas
@@ -327,160 +255,86 @@ OFERTA
 - Trabajo 100% a medida.
 - Relevamiento/medición a domicilio sin cargo.
 - Envíos a todo el país.
-`;
-
-  const system = `
-Sos Caia, asistente comercial de Cortinas Argentinas (Rosario, Santa Fe).
-
-OBJETIVO (LEAD-GEN)
-- Que el cliente se sienta cómodo y avanzar hacia un cierre.
-- Resolver consultas generales.
-- Recomendar 1–2 opciones simples.
-- Mantener conversación con 1 pregunta suave o siguiente paso.
-- Con señales claras de intención, sugerí medición sin cargo como camino práctico.
-
-REGLAS CLAVE
-- Usá SOLO FACTS. No inventes.
-- Nunca des precios/promos/cuotas/estimaciones.
-- NO pidas fotos.
-
-HARD RULES DE DERIVACIÓN (needs_human)
-Solo needs_human=true si el usuario pide explícitamente:
-(a) precio/presupuesto/cotización
-(b) coordinar visita/medición/relevamiento / “cuándo pueden pasar”
-(c) hablar con un humano/asesor/persona
-
-Si needs_human=true:
-- Respondé confirmando que lo derivás ahora + agradecé.
-- NO pidas datos extra (nombre/zona lo gestiona el backend).
-
-ESTILO
-- WhatsApp, cálido, breve.
-- 1 pregunta máximo.
-- Emojis 0–1 y no siempre.
-
-EVITAR REPETICIÓN
-- No repitas beneficios más de 1 vez cada 4 mensajes.
-
-PRIMER MENSAJE
-Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?
-
-FACTS
-${FACTS}
-
-SALIDA
-SOLO JSON: {"reply":"...", "needs_human": true/false}
 `;
 
   const recent = (lead?.messages || [])
-    .slice(-10)
+    .slice(-14)
     .map((m) => `${m.from === "lead" ? "Cliente" : m.from === "bot" ? "Asistente" : "Sistema"}: ${m.text}`)
     .join("\n");
 
-  const leadCtx = `
-Contexto detectado:
-- Nombre: ${lead?.name || "desconocido"}
-- Zona: ${lead?.zone || "desconocida"}
-`;
+  const state = {
+    name: lead?.name || "",
+    zone: lead?.zone || "",
+    intentSummary: lead?.intentSummary || "",
+    pendingHandoff: lead?.pendingHandoff || null,
+    handedOff: Boolean(lead?.handedOff),
+  };
 
-  const r = await openai.responses.create({
-    model: "gpt-5",
-    reasoning: { effort: "low" },
-    instructions: system,
-    input: `${leadCtx}\nHistorial:\n${recent}\n\nMensaje actual (${from}): ${incoming}`,
-  });
+  const instructions = `
+Sos Caia, asistente comercial de Cortinas Argentinas (Rosario, Santa Fe).
 
-  const text = (r.output_text || "").trim();
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error("aiReply_invalid_json");
+TU TRABAJO (en una sola respuesta JSON):
+1) Responder al cliente de forma cálida, breve y útil.
+2) EXTRAER/ACTUALIZAR estado si aparece explícito:
+   - name: nombre del cliente (solo nombre o nombre+apellido si es claro).
+   - zone: barrio/ciudad/zona.
+   - intentSummary: 1 línea con qué quiere el cliente (ej: "Cortinas blackout para oficina, reducir reflejos y mantener luz").
+   Regla: si no es claro, dejalo vacío y NO inventes.
+3) Detectar si el cliente pidió EXPLÍCITAMENTE:
+   - handoff_intent = "price" si pide precio/presupuesto/cotización.
+   - handoff_intent = "visit" si pide coordinar visita/medición/relevamiento/agendar.
+   - handoff_intent = "none" en cualquier otro caso (incluye cuando el bot sugirió visita y el cliente solo dijo "dale" sin pedir coordinar).
+4) Si handoff_intent != "none", antes de derivar necesitamos 3 cosas:
+   - intentSummary NO vacío
+   - name NO vacío
+   - zone NO vacío
+   Si falta algo, NO derivar. En ese caso, reply debe pedir SOLO lo que falta, en un tono cordial y sin perder el hilo.
+   Si están las 3 cosas, reply debe confirmar derivación (sin pedir más datos) y agradecer.
 
-  return JSON.parse(text.slice(start, end + 1));
+REGLAS DE ESTILO:
+- WhatsApp, humano, breve.
+- Máximo 1 pregunta por mensaje.
+- Emojis 0–1 (no siempre).
+- No repetir beneficios cada mensaje.
+
+REGLAS DE NEGOCIO:
+- Usá SOLO FACTS, no inventes.
+- Nunca des precios/promos/cuotas/estimaciones.
+- No pidas fotos.
+
+SALIDA: SOLO JSON válido, sin texto extra:
+{
+  "reply": "...",
+  "name": "",
+  "zone": "",
+  "intentSummary": "",
+  "handoff_intent": "none" | "price" | "visit"
 }
-
-// ======= AI: recovery reply (smart fallback, no reset) =======
-async function recoveryReply({ incoming, lead }) {
-  const FACTS = `
-EMPRESA
-- Nombre comercial: Cortinas Argentinas
-- Ubicación / showroom: Bv. Avellaneda Bis 235, S2000 Rosario, Santa Fe
-- Horarios de atención: 8 a 17 hs
-- Medios de pago: Todos
-- Plazos de entrega: entre 7 y 21 días dependiendo el tipo de trabajo
-
-OFERTA
-- Productos/servicios: Roller, textiles, bandas verticales, toldos y cerramientos.
-- Trabajo 100% a medida.
-- Relevamiento/medición a domicilio sin cargo.
-- Envíos a todo el país.
 `;
-
-  const system = `
-Sos Caia (Cortinas Argentinas). Esto es un RECOVERY para no romper la conversación.
-
-OBJETIVO
-- Pedir disculpas breve.
-- Mostrar que entendiste el contexto (1 línea).
-- Hacer 1 sola pregunta que destrabe el siguiente paso.
-- No reinicies con “¿en qué te puedo ayudar?”.
-
-REGLAS
-- Usá SOLO FACTS.
-- NO pidas fotos.
-- NO des precios.
-- 1 pregunta máximo.
-
-DETECTÁ EL ESTADO
-A partir del historial, detectá si ya se conoce:
-- ambiente (living/dormitorio/oficina)
-- prioridad (oscurecer/luz/reflejos/privacidad)
-Si ya se conoce algo, NO lo vuelvas a preguntar; preguntá lo que falte.
-
-SALIDA
-SOLO JSON: {"reply":"..."}
-`;
-
-  const recentMsgs = (lead?.messages || []).slice(-12);
-  const transcript = recentMsgs
-    .map((m) => `${m.from === "lead" ? "Cliente" : m.from === "bot" ? "Asistente" : "Sistema"}: ${m.text}`)
-    .join("\n");
 
   const r = await openai.responses.create({
     model: "gpt-5",
     reasoning: { effort: "low" },
-    instructions: system,
-    input: `FACTS:\n${FACTS}\n\nHistorial:\n${transcript}\n\nÚltimo mensaje del cliente: ${incoming}`,
+    instructions,
+    input: `FACTS:\n${FACTS}\n\nESTADO_ACTUAL:\n${JSON.stringify(state)}\n\nHISTORIAL_RECIENTE:\n${recent}\n\nMENSAJE_CLIENTE:\n${incoming}`,
   });
 
   const text = (r.output_text || "").trim();
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("ai_output_not_json");
 
-  if (start < 0 || end <= start) {
-    const hasAmb =
-      /living|comedor|oficina|dormitorio|habitación/i.test(transcript);
-
-    const ask = hasAmb
-      ? "¿Qué te importa más ahí: bajar reflejos, mantener luz natural o sumar privacidad?"
-      : "¿Para qué ambiente sería: living, dormitorio u oficina?";
-
-    return { reply: `Disculpá, se me cortó una parte. ${ask}` };
-  }
-
-  try {
-    const parsed = JSON.parse(text.slice(start, end + 1));
-    if (parsed && typeof parsed.reply === "string" && parsed.reply.trim()) {
-      return { reply: parsed.reply.trim() };
-    }
-  } catch {}
-
+  const parsed = JSON.parse(text.slice(start, end + 1));
   return {
-    reply:
-      "Disculpá, se me cortó una parte. ¿Qué te importa más: bajar reflejos, mantener luz natural o sumar privacidad?",
+    reply: typeof parsed.reply === "string" ? parsed.reply.trim() : "",
+    name: typeof parsed.name === "string" ? parsed.name.trim() : "",
+    zone: typeof parsed.zone === "string" ? parsed.zone.trim() : "",
+    intentSummary: typeof parsed.intentSummary === "string" ? parsed.intentSummary.trim() : "",
+    handoff_intent: parsed.handoff_intent,
   };
 }
 
-// ======= Handoff helper =======
+// ======= Handoff =======
 async function doHandoff({ lead, incoming, reasonTag }) {
   if (lead.handedOff) return;
 
@@ -504,6 +358,7 @@ async function doHandoff({ lead, incoming, reasonTag }) {
       `${reasonTag === "visit" ? "📅" : "🧑‍💼"} HANDOFF (${reasonTag})\n` +
         `Nombre: ${lead.name || "sin_nombre"}\n` +
         `Zona: ${lead.zone || "sin_zona"}\n` +
+        `Interés: ${lead.intentSummary || "sin_contexto"}\n` +
         `Tel: ${lead.phone}\n` +
         `Mensaje: ${incoming}\n` +
         `Snapshot: ${path.basename(snapshotPath)}`
@@ -511,87 +366,11 @@ async function doHandoff({ lead, incoming, reasonTag }) {
   }
 }
 
-function askForMissingLeadData(lead) {
-  const missingName = !lead.name;
-  const missingZone = !lead.zone;
-
-  if (missingName && missingZone) {
-    return "Dale 🙂 Para coordinarlo bien, ¿me decís tu nombre y en qué zona/barrio estás?";
-  }
-  if (missingName) return "Dale 🙂 ¿Me decís tu nombre?";
-  return "Perfecto 🙂 ¿En qué zona/barrio estás (Rosario o alrededores)?";
-}
-
-function ensureNameZoneBeforeHandoff({ lead, type, incoming }) {
-  if (!lead.name || !lead.zone) {
-    lead.pendingHandoff = { type, lastIntentText: incoming };
-    return { ok: false, reply: askForMissingLeadData(lead) };
-  }
-  return { ok: true, reply: "" };
-}
-
-// ======= Main processing (async, after FAST_ACK) =======
+// ======= Main processing (async after FAST_ACK) =======
 async function processInbound({ incoming, from, lead }) {
-  // 0) Quick regex extraction ALWAYS (instant, no timeouts)
-  try {
-    const quick = extractByRegex(incoming);
-    applySignalsToLead(lead, quick);
-    upsertConversationFile(lead);
-  } catch (e) {
-    console.log("extractByRegex/applySignals error:", e?.message || e);
-  }
-
-  // 1) Intents that trigger handoff
-  const budgetIntent = /presupuesto|cotiz|precio|cu[aá]nto|vale|valor/i.test(incoming);
-  const visitIntent =
-    /visita|agendar|agenda|coordinar|coordinemos|medir|medición|relevamiento|cuando\s+podr[ií]an\s+pasar|cu[aá]ndo\s+podr[ií]an\s+pasar/i.test(
-      incoming
-    );
-  const humanIntent = /humano|asesor|vendedor|persona|operador|hablar con alguien|derivame|pasame con/i.test(incoming);
-
-  const needsHandoff = budgetIntent || visitIntent || humanIntent || (lead.pendingHandoff && !lead.handedOff);
-
-  // 2) If we need name/zone for handoff flow, try AI extraction as backup (timeout-protected)
-  if (needsHandoff && (!lead.name || !lead.zone)) {
-    try {
-      const sig = await withTimeout(extractLeadSignals({ incoming, lead }), 2500);
-      applySignalsToLead(lead, sig);
-      upsertConversationFile(lead);
-    } catch (e) {
-      console.log("extractLeadSignals timeout/err:", e?.message || e);
-    }
-  }
-
-  // 3) Pending handoff: continue collecting
-  if (lead.pendingHandoff && !lead.handedOff) {
-    if (lead.name && lead.zone) {
-      const type = lead.pendingHandoff.type;
-      lead.pendingHandoff = null;
-
-      await doHandoff({ lead, incoming, reasonTag: type });
-
-      const reply =
-        `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
-        `Gracias por escribirnos.`;
-
-      appendMessage(lead, "bot", reply);
-      upsertConversationFile(lead);
-
-      await sendWhatsApp(from, reply);
-      return;
-    }
-
-    const ask = askForMissingLeadData(lead);
-    appendMessage(lead, "bot", ask);
-    upsertConversationFile(lead);
-    await sendWhatsApp(from, ask);
-    return;
-  }
-
-  // 4) After handoff: minimal reply, optionally forward to HANDOFF_TO (only when DEV_MODE=false)
+  // If already handed off: acknowledge + optionally forward to HANDOFF_TO
   if (lead.handedOff) {
     const reply = `¡Gracias${lead.name ? `, ${lead.name}` : ""}! Ya se lo pasé al asesor 🙌`;
-
     appendMessage(lead, "bot", reply);
     upsertConversationFile(lead);
 
@@ -603,6 +382,7 @@ async function processInbound({ incoming, from, lead }) {
         "📩 Mensaje después del handoff\n" +
           `Nombre: ${lead.name || "sin_nombre"}\n` +
           `Zona: ${lead.zone || "sin_zona"}\n` +
+          `Interés: ${lead.intentSummary || "sin_contexto"}\n` +
           `Tel: ${lead.phone}\n` +
           `Mensaje: ${incoming}`
       );
@@ -610,59 +390,53 @@ async function processInbound({ incoming, from, lead }) {
     return;
   }
 
-  // 5) New handoff intent (GATED by name+zone)
-  if (budgetIntent || visitIntent || humanIntent) {
-    const type = visitIntent ? "visit" : budgetIntent ? "budget" : "human";
-
-    const gate = ensureNameZoneBeforeHandoff({ lead, type, incoming });
-    if (!gate.ok) {
-      appendMessage(lead, "bot", gate.reply);
-      upsertConversationFile(lead);
-      await sendWhatsApp(from, gate.reply);
-      return;
-    }
-
-    await doHandoff({ lead, incoming, reasonTag: type });
-
-    const reply =
-      `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor.\n` +
-      `Gracias por escribirnos.`;
-
-    appendMessage(lead, "bot", reply);
+  // AI decides reply + extracts state + detects explicit handoff intent
+  let out;
+  try {
+    out = await withTimeout(aiDecideAndReply({ incoming, lead }), 9000);
+  } catch (e) {
+    console.error("aiDecideAndReply error:", e?.message || e);
+    const fallback = "Disculpá, tuve un error. ¿Me contás brevemente qué tipo de cortina buscás y para qué ambiente?";
+    appendMessage(lead, "bot", fallback);
     upsertConversationFile(lead);
-
-    await sendWhatsApp(from, reply);
+    await sendWhatsApp(from, fallback);
     return;
   }
 
-  // 6) Otherwise: AI assists (timeout-protected) + recovery fallback
-  let reply = "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
+  // Apply state updates (only if non-empty)
+  if (!lead.name && out.name) lead.name = out.name;
+  if (!lead.zone && out.zone) lead.zone = out.zone;
+  if (!lead.intentSummary && out.intentSummary) lead.intentSummary = out.intentSummary;
 
-  try {
-    const out = await withTimeout(aiReply({ from, incoming, lead }), 9000);
-    if (out && typeof out.reply === "string" && out.reply.trim()) {
-      reply = out.reply.trim();
-    } else {
-      throw new Error("aiReply_missing_reply");
-    }
-  } catch (e) {
-    console.log("aiReply failed -> recovery:", e?.message || e);
-    try {
-      const rec = await withTimeout(recoveryReply({ incoming, lead }), 6000);
-      if (rec && typeof rec.reply === "string" && rec.reply.trim()) {
-        reply = rec.reply.trim();
-      } else {
-        reply = "Disculpá, se me cortó una parte. ¿Para qué ambiente sería: living, dormitorio u oficina?";
-      }
-    } catch (e2) {
-      console.log("recoveryReply failed:", e2?.message || e2);
-      reply = "Disculpá, se me cortó una parte. ¿Para qué ambiente sería: living, dormitorio u oficina?";
-    }
-  }
-
-  appendMessage(lead, "bot", reply);
   upsertConversationFile(lead);
 
+  // Determine if handoff should occur now
+  const handoffIntent = out.handoff_intent;
+  const needsHandoff = handoffIntent === "price" || handoffIntent === "visit";
+
+  // If AI says explicit handoff intent, we require 3 fields before doing it
+  if (needsHandoff) {
+    // If still missing any required info, we DO NOT handoff; we just send the AI reply (which must ask for missing)
+    const ready = Boolean(lead.name && lead.zone && lead.intentSummary);
+
+    appendMessage(lead, "bot", out.reply || "Perfecto 🙂 ¿Me decís tu nombre y en qué zona estás?");
+    upsertConversationFile(lead);
+    await sendWhatsApp(from, out.reply || "Perfecto 🙂 ¿Me decís tu nombre y en qué zona estás?");
+
+    if (ready) {
+      await doHandoff({ lead, incoming, reasonTag: handoffIntent });
+    } else {
+      // remember pending intent (optional)
+      lead.pendingHandoff = { type: handoffIntent, requestedAt: nowTs() };
+      upsertConversationFile(lead);
+    }
+    return;
+  }
+
+  // Normal (no handoff): just reply
+  const reply = out.reply || "Hola 👋 Soy Caia, asistente de Cortinas Argentinas. ¿En qué te puedo ayudar?";
+  appendMessage(lead, "bot", reply);
+  upsertConversationFile(lead);
   await sendWhatsApp(from, reply);
 }
 
@@ -683,7 +457,6 @@ app.post("/whatsapp", (req, res) => {
   appendMessage(lead, "lead", incoming);
   upsertConversationFile(lead);
 
-  // FAST_ACK: respond immediately so Twilio never times out
   if (FAST_ACK) {
     res.status(200).send("OK");
 
@@ -692,11 +465,9 @@ app.post("/whatsapp", (req, res) => {
       appendMessage(lead, "system", `PROCESS_INBOUND_ERR: ${e?.message || e}`);
       upsertConversationFile(lead);
     });
-
     return;
   }
 
-  // Fallback (non-FAST_ACK): synchronous (not recommended)
   (async () => {
     try {
       await processInbound({ incoming, from, lead });
@@ -708,7 +479,7 @@ app.post("/whatsapp", (req, res) => {
   })();
 });
 
-// ======= Listen (Render uses PORT) =======
+// ======= Listen =======
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Webhook listo en puerto ${PORT}`);
