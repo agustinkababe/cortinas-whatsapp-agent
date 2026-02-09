@@ -137,6 +137,7 @@ function buildTranscript(lead) {
     `- name: ${lead.name || "sin_nombre"}\n` +
     `- zone: ${lead.zone || "sin_zona"}\n` +
     `- intentSummary: ${lead.intentSummary || "sin_contexto"}\n` +
+    `- availability: ${lead.availability || "sin_disponibilidad"}\n` +
     `- createdAt: ${lead.createdAt}\n` +
     `- handedOff: ${lead.handedOff}\n` +
     `- pendingHandoff: ${lead.pendingHandoff ? JSON.stringify(lead.pendingHandoff) : "null"}\n\n`;
@@ -158,7 +159,8 @@ function saveLeadSnapshot(lead, tag = "handoff") {
   const nameSafe = sanitizeForFilename(lead.name || "sin_nombre");
   const zoneSafe = sanitizeForFilename(lead.zone || "sin_zona");
   const intentSafe = sanitizeForFilename(lead.intentSummary || "sin_contexto");
-  const fname = `${ts}_${tag}_${phoneSafe}_${nameSafe}_${zoneSafe}_${intentSafe}.txt`;
+  const availSafe = sanitizeForFilename(lead.availability || "sin_disponibilidad");
+  const fname = `${ts}_${tag}_${phoneSafe}_${nameSafe}_${zoneSafe}_${intentSafe}_${availSafe}.txt`;
   const fpath = path.join(LEADS_DIR, fname);
   fs.writeFileSync(fpath, buildTranscript(lead), "utf8");
   return fpath;
@@ -221,6 +223,7 @@ app.get("/debug/leads", (req, res) => {
     name: l.name || "",
     zone: l.zone || "",
     intentSummary: l.intentSummary || "",
+    availability: l.availability || "",
     createdAt: l.createdAt,
     handedOff: Boolean(l.handedOff),
     pendingHandoff: l.pendingHandoff || null,
@@ -250,6 +253,7 @@ app.get("/debug/conversation", (req, res) => {
       name: lead.name || "",
       zone: lead.zone || "",
       intentSummary: lead.intentSummary || "",
+      availability: lead.availability || "",
       createdAt: lead.createdAt,
       handedOff: Boolean(lead.handedOff),
       pendingHandoff: lead.pendingHandoff || null,
@@ -386,35 +390,77 @@ function applyStateFromAI(lead, out) {
 function timeoutFallbackReply(lead, incoming) {
   const t = String(incoming || "").toLowerCase();
 
+  // Si ya estábamos en flujo de handoff, respetarlo (clave cuando hay timeouts)
+  const pending = lead?.pendingHandoff?.type; // "visit" | "price" | null
+
   const looksLikeVisit =
-    t.includes("visita") || t.includes("medicion") || t.includes("medición") || t.includes("relevamiento") || t.includes("agendar") || t.includes("coordinar");
+    pending === "visit" ||
+    t.includes("visita") ||
+    t.includes("medicion") ||
+    t.includes("medición") ||
+    t.includes("relevamiento") ||
+    t.includes("agendar") ||
+    t.includes("coordinar");
 
   const looksLikePrice =
-    t.includes("precio") || t.includes("presupuesto") || t.includes("cotiz") || t.includes("cuanto") || t.includes("cuánto") || t.includes("valor");
+    pending === "price" ||
+    t.includes("precio") ||
+    t.includes("presupuesto") ||
+    t.includes("cotiz") ||
+    t.includes("cuanto") ||
+    t.includes("cuánto") ||
+    t.includes("valor");
 
-  // If user is asking for visit/price, we must collect: intentSummary + name + zone
+  // Missing fields (para “visit” requiere availability también)
   const missing = [];
   if (!lead.intentSummary) missing.push("qué estás buscando (en 1 frase)");
   if (!lead.name) missing.push("tu nombre");
   if (!lead.zone) missing.push("tu zona/barrio");
+  if (looksLikeVisit && !lead.availability) missing.push("qué día y horario te queda mejor (de 8 a 17)");
 
   if (looksLikeVisit || looksLikePrice) {
     if (missing.length) {
-      // Ask only ONE thing (best next missing), to keep WhatsApp natural
-      const ask = missing[0];
-      return `Dale 🙂 Para ayudarte con eso, ¿me decís ${ask}?`;
+      // Preguntar SOLO 1 cosa
+      return `Dale 🙂 Para coordinarlo bien, ¿me decís ${missing[0]}?`;
     }
-    // If we somehow have all required, we can confirm
-    return `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya te paso con un asesor. ¡Gracias!`;
+
+    // Si está todo, confirmación (sin preguntas)
+    return `Perfecto${lead.name ? `, ${lead.name}` : ""}. 🙌 Ya lo paso al asesor y te contactamos por este mismo WhatsApp en breve. ¡Gracias!`;
   }
 
-  // Normal fallback if not visit/price
+  // Fallback normal (no visit/price)
   if (!lead.intentSummary) {
     return "Disculpá, tuve un problema técnico. ¿Me contás brevemente qué tipo de cortina buscás y para qué ambiente?";
   }
 
-  // If we have intentSummary, ask a single useful qualifier question
   return "Disculpá, tuve un problema técnico. ¿Tu prioridad es más oscurecer, bajar reflejos o ganar privacidad?";
+}
+
+function inferHandoffIntentFromText(lead, incoming) {
+  const t = String(incoming || "").toLowerCase();
+  const pending = lead?.pendingHandoff?.type;
+
+  const visit =
+    pending === "visit" ||
+    t.includes("visita") ||
+    t.includes("medicion") ||
+    t.includes("medición") ||
+    t.includes("relevamiento") ||
+    t.includes("agendar") ||
+    t.includes("coordinar");
+
+  const price =
+    pending === "price" ||
+    t.includes("precio") ||
+    t.includes("presupuesto") ||
+    t.includes("cotiz") ||
+    t.includes("cuanto") ||
+    t.includes("cuánto") ||
+    t.includes("valor");
+
+  if (visit) return "visit";
+  if (price) return "price";
+  return "none";
 }
 
 // ======= Handoff =======
@@ -422,6 +468,7 @@ async function doHandoff({ lead, incoming, reasonTag }) {
   if (lead.handedOff) return;
 
   lead.handedOff = true;
+  lead.pendingHandoff = null;
   const snapshotPath = saveLeadSnapshot(lead, reasonTag);
   upsertConversationFile(lead);
 
@@ -436,17 +483,19 @@ async function doHandoff({ lead, incoming, reasonTag }) {
   }
 
   if (HANDOFF_TO) {
-    await sendWhatsApp(
-      HANDOFF_TO,
-      `${reasonTag === "visit" ? "📅" : "🧑‍💼"} HANDOFF (${reasonTag})\n` +
-        `Nombre: ${lead.name || "sin_nombre"}\n` +
-        `Zona: ${lead.zone || "sin_zona"}\n` +
-        `Interés: ${lead.intentSummary || "sin_contexto"}\n` +
-        (reasonTag === "visit" ? `Disponibilidad: ${lead.availability || "sin_disponibilidad"}\n` : "") +
-        `Tel: ${lead.phone}\n` +
-        `Mensaje: ${incoming}\n` +
-        `Snapshot: ${path.basename(snapshotPath)}`
-    );
+    const header = `${reasonTag === "visit" ? "📅" : "🧑‍💼"} HANDOFF (${reasonTag})`;
+    const lines = [
+      header,
+      `Nombre: ${lead.name || "sin_nombre"}`,
+      `Zona: ${lead.zone || "sin_zona"}`,
+      `Interés: ${lead.intentSummary || "sin_contexto"}`,
+      ...(reasonTag === "visit" ? [`Disponibilidad: ${lead.availability || "sin_disponibilidad"}`] : []),
+      `Tel: ${lead.phone}`,
+      `Mensaje: ${incoming}`,
+      `Snapshot: ${path.basename(snapshotPath)}`,
+    ];
+  
+    await sendWhatsApp(HANDOFF_TO, lines.join("\n"));
   }
 }
 
@@ -475,11 +524,28 @@ async function processInbound({ incoming, from, lead }) {
       out = await withTimeout(aiDecideAndReply({ incoming, lead, model: MODEL_SMART }), AI_TIMEOUT_RETRY);
     } catch (e2) {
       console.error("aiDecideAndReply retry error:", e2?.message || e2);
-
+    
+      // Marcar pending si detectamos visit/price por texto o estado previo
+      const inferred = inferHandoffIntentFromText(lead, incoming);
+      if (inferred === "visit" || inferred === "price") {
+        lead.pendingHandoff = { type: inferred, requestedAt: nowTs() };
+        upsertConversationFile(lead);
+      }
+    
       const fb = timeoutFallbackReply(lead, incoming);
       appendMessage(lead, "bot", fb);
       upsertConversationFile(lead);
       await sendWhatsApp(from, fb);
+    
+      // Si ya está todo listo, ejecutamos handoff igual aunque el AI haya fallado
+      if (inferred === "visit") {
+        const readyVisit = Boolean(lead.intentSummary && lead.name && lead.zone && lead.availability);
+        if (readyVisit) await doHandoff({ lead, incoming, reasonTag: "visit" });
+      } else if (inferred === "price") {
+        const readyPrice = Boolean(lead.intentSummary && lead.name && lead.zone);
+        if (readyPrice) await doHandoff({ lead, incoming, reasonTag: "price" });
+      }
+    
       return;
     }
   } finally {
