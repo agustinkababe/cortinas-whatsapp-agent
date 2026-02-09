@@ -115,12 +115,11 @@ function getLead(phone) {
       name: "",
       zone: "",
       intentSummary: "",
-      availability: "", // <-- NUEVO: días/horarios propuestos por el lead (8 a 17)
+      availability: "", // <-- NUEVO
       messages: [],
       createdAt: nowTs(),
       handedOff: false,
-      pendingHandoff: null, // { type: "visit"|"price", requestedAt: ts }
-      // queue/mutex:
+      pendingHandoff: null,
       _queue: Promise.resolve(),
     };
   }
@@ -314,18 +313,25 @@ Sos Caia, asistente comercial de Cortinas Argentinas.
 Tarea:
 - Responder breve y útil.
 - Actualizar estado SOLO si el cliente lo dijo explícito:
-  name, zone, intentSummary (1 línea de qué busca), availability (días/horarios posibles dentro de 8 a 17).
+  name, zone, intentSummary (1 línea de qué busca), availability (día/horario posible).
 - Detectar si el cliente pidió EXPLÍCITAMENTE:
   handoff_intent="price" (precio/presupuesto/cotización) o "visit" (coordinar visita/medición/agendar).
   Si no lo pidió explícito: "none".
 
-GATES (importante):
-- Si handoff_intent="price": NO derivas aún a menos que existan intentSummary + name + zone.
-- Si handoff_intent="visit": NO derivas aún a menos que existan intentSummary + name + zone + availability.
-- Si falta algo, pedí SOLO lo que falte (máximo 1 pregunta) sin perder el hilo.
-  Ejemplo si falta availability: pedir 1 opción concreta ("¿Qué día y horario te queda mejor dentro de 8 a 17?").
+Reglas: no inventar, no precios, no fotos, 0-1 emoji.
 
-Reglas: no inventar, no precios, no fotos, 0-1 emoji, 1 pregunta máx.
+IMPORTANTE (handoff):
+- Para "price": NO derivar aún a menos que existan intentSummary + name + zone.
+- Para "visit": NO derivar aún a menos que existan intentSummary + name + zone + availability.
+
+Si falta algo y handoff_intent != "none":
+- reply debe pedir SOLO lo que falta.
+- Máximo 1 pregunta.
+
+Si YA están todos los datos requeridos (según el tipo):
+- reply NO debe hacer preguntas.
+- reply debe: confirmar (1 línea) + decir “Te contactamos por este mismo WhatsApp en breve” + agradecer.
+
 Salida: JSON estricto:
 {"reply":"...","name":"","zone":"","intentSummary":"","availability":"","handoff_intent":"none|price|visit"}
 `.trim();
@@ -430,27 +436,17 @@ async function doHandoff({ lead, incoming, reasonTag }) {
   }
 
   if (HANDOFF_TO) {
-    const header = reasonTag === "visit" ? "📅" : "🧑‍💼";
-  
-    const lines = [
-      `${header} HANDOFF (${reasonTag})`,
-      `Nombre: ${lead.name || "sin_nombre"}`,
-      `Zona: ${lead.zone || "sin_zona"}`,
-      `Interés: ${lead.intentSummary || "sin_contexto"}`,
-    ];
-  
-    // Mostrar disponibilidad solo si es visita (más prolijo)
-    if (reasonTag === "visit") {
-      lines.push(`Disponibilidad: ${lead.availability || "sin_disponibilidad"}`);
-    }
-  
-    lines.push(
-      `Tel: ${lead.phone}`,
-      `Mensaje: ${incoming}`,
-      `Snapshot: ${path.basename(snapshotPath)}`
+    await sendWhatsApp(
+      HANDOFF_TO,
+      `${reasonTag === "visit" ? "📅" : "🧑‍💼"} HANDOFF (${reasonTag})\n` +
+        `Nombre: ${lead.name || "sin_nombre"}\n` +
+        `Zona: ${lead.zone || "sin_zona"}\n` +
+        `Interés: ${lead.intentSummary || "sin_contexto"}\n` +
+        (reasonTag === "visit" ? `Disponibilidad: ${lead.availability || "sin_disponibilidad"}\n` : "") +
+        `Tel: ${lead.phone}\n` +
+        `Mensaje: ${incoming}\n` +
+        `Snapshot: ${path.basename(snapshotPath)}`
     );
-  
-    await sendWhatsApp(HANDOFF_TO, lines.join("\n"));
   }
 }
 
@@ -501,21 +497,19 @@ async function processInbound({ incoming, from, lead }) {
   const wantsHandoff = handoffIntent === "price" || handoffIntent === "visit";
 
   if (wantsHandoff) {
-    // Gate:
-    const readyBase = Boolean(lead.intentSummary && lead.name && lead.zone);
     const ready =
       handoffIntent === "visit"
-        ? Boolean(readyBase && lead.availability) // <-- VISIT requiere availability
-        : readyBase; // <-- PRICE mantiene 3 campos
+        ? Boolean(lead.intentSummary && lead.name && lead.zone && lead.availability)
+        : Boolean(lead.intentSummary && lead.name && lead.zone);
 
-    appendMessage(lead, "bot", reply);
+    const msg = out.reply || "Perfecto 🙂";
+    appendMessage(lead, "bot", msg);
     upsertConversationFile(lead);
-    await sendWhatsApp(from, reply);
+    await sendWhatsApp(from, msg);
 
     if (ready) {
       await doHandoff({ lead, incoming, reasonTag: handoffIntent });
     } else {
-      // keep pending for debug visibility
       lead.pendingHandoff = { type: handoffIntent, requestedAt: nowTs() };
       upsertConversationFile(lead);
     }
