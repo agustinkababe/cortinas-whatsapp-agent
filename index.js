@@ -115,6 +115,7 @@ function getLead(phone) {
       name: "",
       zone: "",
       intentSummary: "",
+      availability: "", // <-- NUEVO: días/horarios propuestos por el lead (8 a 17)
       messages: [],
       createdAt: nowTs(),
       handedOff: false,
@@ -301,6 +302,7 @@ async function aiDecideAndReply({ incoming, lead, model }) {
     name: lead?.name || "",
     zone: lead?.zone || "",
     intentSummary: lead?.intentSummary || "",
+    availability: lead?.availability || "", // <-- NUEVO
     pendingHandoff: lead?.pendingHandoff || null,
     handedOff: Boolean(lead?.handedOff),
   };
@@ -312,15 +314,20 @@ Sos Caia, asistente comercial de Cortinas Argentinas.
 Tarea:
 - Responder breve y útil.
 - Actualizar estado SOLO si el cliente lo dijo explícito:
-  name, zone, intentSummary (1 línea de qué busca).
+  name, zone, intentSummary (1 línea de qué busca), availability (días/horarios posibles dentro de 8 a 17).
 - Detectar si el cliente pidió EXPLÍCITAMENTE:
   handoff_intent="price" (precio/presupuesto/cotización) o "visit" (coordinar visita/medición/agendar).
   Si no lo pidió explícito: "none".
-- Si handoff_intent != "none": NO derivas aún a menos que existan intentSummary + name + zone.
-  Si falta algo, pedí SOLO lo que falte (máximo 1 pregunta) sin perder el hilo.
+
+GATES (importante):
+- Si handoff_intent="price": NO derivas aún a menos que existan intentSummary + name + zone.
+- Si handoff_intent="visit": NO derivas aún a menos que existan intentSummary + name + zone + availability.
+- Si falta algo, pedí SOLO lo que falte (máximo 1 pregunta) sin perder el hilo.
+  Ejemplo si falta availability: pedir 1 opción concreta ("¿Qué día y horario te queda mejor dentro de 8 a 17?").
+
 Reglas: no inventar, no precios, no fotos, 0-1 emoji, 1 pregunta máx.
 Salida: JSON estricto:
-{"reply":"...","name":"","zone":"","intentSummary":"","handoff_intent":"none|price|visit"}
+{"reply":"...","name":"","zone":"","intentSummary":"","availability":"","handoff_intent":"none|price|visit"}
 `.trim();
 
   const input = `
@@ -355,6 +362,7 @@ ${incoming}
     name: typeof parsed.name === "string" ? parsed.name.trim() : "",
     zone: typeof parsed.zone === "string" ? parsed.zone.trim() : "",
     intentSummary: typeof parsed.intentSummary === "string" ? parsed.intentSummary.trim() : "",
+    availability: typeof parsed.availability === "string" ? parsed.availability.trim() : "", // <-- NUEVO
     handoff_intent: parsed.handoff_intent,
   };
 }
@@ -363,6 +371,7 @@ function applyStateFromAI(lead, out) {
   if (!lead.name && out.name) lead.name = out.name;
   if (!lead.zone && out.zone) lead.zone = out.zone;
   if (!lead.intentSummary && out.intentSummary) lead.intentSummary = out.intentSummary;
+  if (!lead.availability && out.availability) lead.availability = out.availability; // <-- NUEVO
 }
 
 // Fallback ONLY when AI timed out.
@@ -421,16 +430,27 @@ async function doHandoff({ lead, incoming, reasonTag }) {
   }
 
   if (HANDOFF_TO) {
-    await sendWhatsApp(
-      HANDOFF_TO,
-      `${reasonTag === "visit" ? "📅" : "🧑‍💼"} HANDOFF (${reasonTag})\n` +
-        `Nombre: ${lead.name || "sin_nombre"}\n` +
-        `Zona: ${lead.zone || "sin_zona"}\n` +
-        `Interés: ${lead.intentSummary || "sin_contexto"}\n` +
-        `Tel: ${lead.phone}\n` +
-        `Mensaje: ${incoming}\n` +
-        `Snapshot: ${path.basename(snapshotPath)}`
+    const header = reasonTag === "visit" ? "📅" : "🧑‍💼";
+  
+    const lines = [
+      `${header} HANDOFF (${reasonTag})`,
+      `Nombre: ${lead.name || "sin_nombre"}`,
+      `Zona: ${lead.zone || "sin_zona"}`,
+      `Interés: ${lead.intentSummary || "sin_contexto"}`,
+    ];
+  
+    // Mostrar disponibilidad solo si es visita (más prolijo)
+    if (reasonTag === "visit") {
+      lines.push(`Disponibilidad: ${lead.availability || "sin_disponibilidad"}`);
+    }
+  
+    lines.push(
+      `Tel: ${lead.phone}`,
+      `Mensaje: ${incoming}`,
+      `Snapshot: ${path.basename(snapshotPath)}`
     );
+  
+    await sendWhatsApp(HANDOFF_TO, lines.join("\n"));
   }
 }
 
@@ -454,7 +474,6 @@ async function processInbound({ incoming, from, lead }) {
   } catch (e1) {
     console.error("aiDecideAndReply main error:", e1?.message || e1);
 
-    // small backoff then retry with SMART model or same model (configurable)
     await sleep(AI_BACKOFF_MS);
     try {
       out = await withTimeout(aiDecideAndReply({ incoming, lead, model: MODEL_SMART }), AI_TIMEOUT_RETRY);
@@ -482,8 +501,12 @@ async function processInbound({ incoming, from, lead }) {
   const wantsHandoff = handoffIntent === "price" || handoffIntent === "visit";
 
   if (wantsHandoff) {
-    // Gate: must have all 3 fields
-    const ready = Boolean(lead.intentSummary && lead.name && lead.zone);
+    // Gate:
+    const readyBase = Boolean(lead.intentSummary && lead.name && lead.zone);
+    const ready =
+      handoffIntent === "visit"
+        ? Boolean(readyBase && lead.availability) // <-- VISIT requiere availability
+        : readyBase; // <-- PRICE mantiene 3 campos
 
     appendMessage(lead, "bot", reply);
     upsertConversationFile(lead);
